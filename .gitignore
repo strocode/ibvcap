@@ -1,3 +1,9 @@
+
+# captured files
+*.raw
+# binary
+capture
+
 # Prerequisites
 *.d
 

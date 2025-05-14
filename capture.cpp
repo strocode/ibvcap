@@ -22,6 +22,31 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 // Define the GPUERRCHK macro
 #define GPUERRCHK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 
+struct ibv_flow* create_and_attach_default_flow(ibv_qp* qp) {
+    struct ibv_flow_attr *flow_attr;
+    struct ibv_flow_spec_eth *eth_spec;
+    void *buf;
+
+    buf = calloc(1, sizeof(*flow_attr) + sizeof(*eth_spec));
+    flow_attr = (struct ibv_flow_attr*) buf;
+    eth_spec = (struct ibv_flow_spec_eth *)(flow_attr + 1);
+
+    flow_attr->type = IBV_FLOW_ATTR_NORMAL;
+    flow_attr->size = sizeof(*flow_attr) + sizeof(*eth_spec);
+    flow_attr->priority = 0;
+    flow_attr->num_of_specs = 0; // Should be 1. 
+    flow_attr->port = 1;
+    flow_attr->flags = 0;
+
+    eth_spec->type = IBV_FLOW_SPEC_ETH;
+    eth_spec->size = sizeof(*eth_spec);
+    memset(&eth_spec->val, 0, sizeof(eth_spec->val));   // Match all
+    memset(&eth_spec->mask, 0, sizeof(eth_spec->mask)); // No filtering
+
+    struct ibv_flow *flow = ibv_create_flow(qp, flow_attr);
+    return flow;
+}
+
 // Function to initialize the context and QP
 ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
     ibv_qp_init_attr qp_init_attr = {};
@@ -59,26 +84,47 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
         exit(1);
     }
 
+    create_and_attach_default_flow(qp);
+
     return qp;
 }
 
 int main() {
-    std::vector<ibv_context*> contexts(num_interfaces);
-    std::vector<ibv_pd*> pds(num_interfaces);
-    std::vector<ibv_cq*> cqs(num_interfaces);
-    std::vector<ibv_qp*> qps(num_interfaces);
-    std::vector<std::ofstream> files(num_interfaces);
-    std::vector<void*> gpu_buffers(num_interfaces);
-    std::vector<ibv_mr*> mrs(num_interfaces);
-    bool save_gpu = true;
-
+    bool save_gpu = false;
     if (save_gpu) {
         GPUERRCHK(cudaSetDevice(0));
     }
 
-    for (int i = 0; i < num_interfaces; ++i) {
+    // Get the list of devices
+    int num_devices = 0;
+    ibv_device** device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) {
+        std::cerr << "Failed to get IB devices list: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        return 1;
+    }
+
+    std::vector<ibv_context*> contexts(num_devices);
+    std::vector<ibv_pd*> pds(num_devices);
+    std::vector<ibv_cq*> cqs(num_devices);
+    std::vector<ibv_qp*> qps(num_devices);
+    std::vector<std::ofstream> files(num_devices);
+    std::vector<void*> gpu_buffers(num_devices);
+    std::vector<ibv_mr*> mrs(num_devices);
+
+    // Print the list of devices
+    std::cout << "Available devices:" << std::endl;
+    for (int i = 0; i < num_devices; ++i) {
+        std::cout << "Device " << i << ": " << ibv_get_device_name(device_list[i]) << std::endl;
+        interfaces[i] = ibv_get_device_name(device_list[i]);
+    }
+
+    // Free the device list
+    ibv_free_device_list(device_list);
+
+    for (int i = 0; i < num_devices; ++i) {
         files[i].open(std::string(interfaces[i]) + ".raw", std::ios::binary);
 
+        std::cout << "Opening device " << interfaces[i] << "..." << std::endl;
         contexts[i] = ibv_open_device(ibv_get_device_list(nullptr)[i]);
         if (!contexts[i]) {
             std::cerr << "Failed to open device " << interfaces[i] << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
@@ -105,6 +151,7 @@ int main() {
         } else {
             gpu_buffers[i] = malloc(num_frames * MTU);
         }
+        memset(gpu_buffers[i], 0, num_frames * MTU);
         
 
         // Register memory region
@@ -135,11 +182,15 @@ int main() {
         }
     }
     // Main loop to capture packets
-    for (int i = 0; i < num_interfaces; ++i) {
-        for (int j = 0; j < num_frames; ++j) {
+    for (int j = 0; j < num_frames; ++j) {
+        for (int i = 0; i < num_interfaces; ++i) {
             
             ibv_wc wc;
-            while (ibv_poll_cq(cqs[i], 1, &wc) < 1);
+            std::cout << "Waiting for poll completion " << std::endl;
+            while (ibv_poll_cq(cqs[i], 1, &wc) < 1) {
+                printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
+            }
+            std::cout << " Completion polled " << std::endl;
             if (wc.status != IBV_WC_SUCCESS) {
                 std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
                 exit(1);
