@@ -8,8 +8,7 @@
 
 // Define the interfaces and MTU
 const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
-const int num_interfaces = 4;
-const int MTU = 8000;
+const int MTU = 9000;
 const int num_frames = 1000;
 
 
@@ -44,6 +43,11 @@ struct ibv_flow* create_and_attach_default_flow(ibv_qp* qp) {
     memset(&eth_spec->mask, 0, sizeof(eth_spec->mask)); // No filtering
 
     struct ibv_flow *flow = ibv_create_flow(qp, flow_attr);
+    if (! flow) {
+        std::cerr << "Failed to create flow: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        free(buf);
+        exit(1);
+    }
     return flow;
 }
 
@@ -67,6 +71,9 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
     ibv_qp_attr attr = {};
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = 1;
+    //attr.pkey_index = 0; // don't do for raw packet - g et invalid argument
+    //attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE; 
+    
     if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PORT)) {
         std::cerr << "Failed to modify QP to INIT: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
         exit(1);
@@ -102,6 +109,8 @@ int main() {
         std::cerr << "Failed to get IB devices list: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
         return 1;
     }
+
+    num_devices = 1; // For testing, we will only use one device
 
     std::vector<ibv_context*> contexts(num_devices);
     std::vector<ibv_pd*> pds(num_devices);
@@ -147,7 +156,7 @@ int main() {
 
         // Allocate GPU memory
         if (save_gpu) {
-            cudaMalloc(&gpu_buffers[i], num_frames * MTU);
+            GPUERRCHK(cudaMalloManaged(&gpu_buffers[i], num_frames * MTU));
         } else {
             gpu_buffers[i] = malloc(num_frames * MTU);
         }
@@ -163,7 +172,7 @@ int main() {
     }
 
     // Post recieve work requests
-    for (int i = 0; i < num_interfaces; ++i) {
+    for (int i = 0; i < num_devices; ++i) {
         for (int j = 0; j < num_frames; ++j) {
             ibv_recv_wr wr = {};
             ibv_sge sge = {};
@@ -183,12 +192,12 @@ int main() {
     }
     // Main loop to capture packets
     for (int j = 0; j < num_frames; ++j) {
-        for (int i = 0; i < num_interfaces; ++i) {
+        for (int i = 0; i < num_devices; ++i) {
             
             ibv_wc wc;
             std::cout << "Waiting for poll completion " << std::endl;
             while (ibv_poll_cq(cqs[i], 1, &wc) < 1) {
-                printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
+                //printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
             }
             std::cout << " Completion polled " << std::endl;
             if (wc.status != IBV_WC_SUCCESS) {
@@ -201,14 +210,14 @@ int main() {
     }
 
     // Cleanup
-    for (int i = 0; i < num_interfaces; ++i) {
+    for (int i = 0; i < num_devices; ++i) {
         files[i].close();
         ibv_dereg_mr(mrs[i]);
         ibv_destroy_qp(qps[i]);
         ibv_destroy_cq(cqs[i]);
         ibv_dealloc_pd(pds[i]);
         ibv_close_device(contexts[i]);
-        cudaFree(gpu_buffers[i]);
+        GPUERRCHK(cudaFree(gpu_buffers[i]));
     }
 
     return 0;
