@@ -19,6 +19,10 @@
 #include <cstring>
 #include <iostream>
 
+#include <netinet/ether.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+
 // Define the interfaces and MTU
 const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
 const int MTU = 9000;
@@ -225,6 +229,34 @@ void subscribe_to_multicast(const char* interface_name, const char* multicast_ip
     //close(sock);
 }
 
+
+void parse_packet(char *packet, 
+    struct ether_header** eth,
+                   struct ip** ip_hdr, 
+                   struct udphdr** udp_hdr) {
+    *eth = (struct ether_header *)packet;
+    *ip_hdr = nullptr;
+    *udp_hdr = nullptr;
+
+    if (ntohs((*eth)->ether_type) != ETHERTYPE_IP) {
+       // printf("Not an IP packet\n");
+        return;        
+    }
+
+    *ip_hdr = (struct ip *)(packet + sizeof(struct ether_header));
+
+    if ((*ip_hdr)->ip_p != IPPROTO_UDP) {
+       // printf("Not a UDP packet\n");
+        return;
+    }
+
+    int ip_hdr_len = (*ip_hdr)->ip_hl * 4;
+    *udp_hdr = (struct udphdr *)((char *)ip_hdr + ip_hdr_len);
+
+    //printf("UDP Source Port: %u\n", ntohs((*udp_hdr)->uh_sport));
+    //printf("UDP Dest Port  : %u\n", ntohs((*udp_hdr)->uh_dport));
+}
+
 void post_recv(ibv_qp* qp, ibv_mr* mr, void* buffer, uint64_t id, int num_frames) {
     ibv_sge sge = {};
     sge.addr = reinterpret_cast<uintptr_t>(buffer);
@@ -418,9 +450,35 @@ int main(int argc, char* argv[]) {
                 // files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU , MTU);
                 
                 // Only write the CODIF header
-                bool is_codif = wc.byte_len == 8298; // There are more rigorous checks, but this is easy.
+                
                 //std::cout << "Byte len" << wc.byte_len << " is codif " << is_codif << std::endl;
-                files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + jframe * MTU + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+
+                char* packet = reinterpret_cast<char*>(cpu_buffers[i]) + jframe * MTU;
+                struct ether_header* eth ;
+                struct ip* ip_hdr ;
+                struct udphdr* uudp_hdr ;
+                parse_packet(packet, &eth, &ip_hdr, &uudp_hdr);
+                bool is_codif;
+                            
+                if (uudp_hdr != nullptr) {
+                    auto dport = (uudp_hdr->uh_dport);
+                    /*&printf("eth 0x%x 0x%x 0x%x 0x%x %u %d\n", 
+                        ntohs(eth->ether_type), ETHERTYPE_IP, ip_hdr->ip_p,
+                         IPPROTO_UDP, dport, wc.byte_len);
+                     **/
+                    is_codif = wc.byte_len == 8298; // My dport parsing is no good. && dport > 36000; // There are more rigorous checks, but this is easy.
+
+                    //std::cout << "UDP Source Port: " << ntohs(uudp_hdr->uh_sport) << std::endl;
+                    //std::cout << "UDP Dest Port  : " << ntohs(uudp_hdr->uh_dport) << std::endl;
+                } else {
+                    //std::cout << "Not an IP packet" << std::endl;
+                    is_codif = false;
+                }                            
+
+                // write only the CODIF header
+                if (is_codif) {
+                    files[i].write(packet+ ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                }
 
                 // send the buffer back to the QP
                 post_recv(qps[i], mrs[i], gpu_buffers[i] + jframe*MTU, j, 1);                
