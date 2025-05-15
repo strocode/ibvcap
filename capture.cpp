@@ -24,6 +24,12 @@ const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
 const int MTU = 9000;
 const int num_frames = 100;
 
+const int ETH_HDR_SIZE = 14; // Ethernet header size
+const int IP_HDR_SIZE = 20; // IP header size
+const int UDP_HDR_SIZE = 8; // UDP header size
+const int CODIF_HDR_SIZE = 64; // CODIF header size
+const int TOTAL_HDR_SIZE = ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE + CODIF_HDR_SIZE;
+
 
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
     if (code != cudaSuccess) {
@@ -219,6 +225,23 @@ void subscribe_to_multicast(const char* interface_name, const char* multicast_ip
     //close(sock);
 }
 
+void post_recv(ibv_qp* qp, ibv_mr* mr, void* buffer, uint64_t id, int num_frames) {
+    ibv_sge sge = {};
+    sge.addr = reinterpret_cast<uintptr_t>(buffer);
+    sge.length = num_frames * MTU;
+    sge.lkey = mr->lkey;
+
+    ibv_recv_wr wr = {};
+    wr.wr_id = id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    ibv_recv_wr* bad_wr;
+    if (ibv_post_recv(qp, &wr, &bad_wr)) {
+        std::cerr << "Failed to post receive work request: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        exit(1);
+    }
+}
 int main(int argc, char* argv[]) {
     bool save_gpu = false;
     int cuda_dev = 0;
@@ -255,7 +278,7 @@ int main(int argc, char* argv[]) {
                 num_blocks = std::atoi(optarg);
                 break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>]" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>]" << std::endl;
                 return 1;
         }
     }
@@ -282,8 +305,8 @@ int main(int argc, char* argv[]) {
     std::vector<ibv_cq*> cqs(num_devices);
     std::vector<ibv_qp*> qps(num_devices);
     std::vector<std::ofstream> files(num_devices);
-    std::vector<void*> gpu_buffers(num_devices);
-    std::vector<void*> cpu_buffers(num_devices);
+    std::vector<char*> gpu_buffers(num_devices);
+    std::vector<char*> cpu_buffers(num_devices);
     std::vector<ibv_mr*> mrs(num_devices);    
 
     // Print the list of devices
@@ -340,7 +363,7 @@ int main(int argc, char* argv[]) {
         qps[i] = init_qp(contexts[i], pds[i], cqs[i]);
 
         // Allocate GPU memory
-        cpu_buffers[i] = malloc(num_frames * MTU);
+        cpu_buffers[i] = (char*) malloc(num_frames * MTU);
         memset(cpu_buffers[i], 0, num_frames * MTU);
 
         if (save_gpu) {
@@ -363,20 +386,7 @@ int main(int argc, char* argv[]) {
     // Post recieve work requests
     for (int i = 0; i < num_devices; ++i) {
         for (int j = 0; j < num_frames; ++j) {
-            ibv_recv_wr wr = {};
-            ibv_sge sge = {};
-            sge.addr = reinterpret_cast<uintptr_t>(gpu_buffers[i]) + j * MTU;
-            sge.length = MTU;
-            sge.lkey = mrs[i]->lkey;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-
-            ibv_recv_wr* bad_wr;
-            if (ibv_post_recv(qps[i], &wr, &bad_wr)) {
-                std::cerr << "Failed to post recv: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
-                exit(1);
-            }
-
+            post_recv(qps[i], mrs[i], gpu_buffers[i] + j*MTU, j, 1);
         }
     }
 
@@ -395,12 +405,25 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
                     exit(1);
                 }
-
+                auto size_to_copy = wc.byte_len;
+                auto jframe = wc.wr_id; // ID - set to the frame number where the data was written
+                
+                // size_to_copy = MTU; // Copy everything back
+                size_to_copy = TOTAL_HDR_SIZE; // Don't copy all the data
                 if (save_gpu) {
-                    GPUERRCHK(cudaMemcpy(cpu_buffers[i] + j*MTU, gpu_buffers[i] + j*MTU, MTU, cudaMemcpyDeviceToHost));
+                    GPUERRCHK(cudaMemcpy(cpu_buffers[i] + jframe*MTU, gpu_buffers[i] + jframe*MTU, size_to_copy, cudaMemcpyDeviceToHost));
                 } 
 
-                files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU, MTU);
+                // Write whole packet to file
+                // files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU , MTU);
+                
+                // Only write the CODIF header
+                bool is_codif = wc.byte_len == 8298; // There are more rigorous checks, but this is easy.
+                //std::cout << "Byte len" << wc.byte_len << " is codif " << is_codif << std::endl;
+                files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + jframe * MTU + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+
+                // send the buffer back to the QP
+                post_recv(qps[i], mrs[i], gpu_buffers[i] + jframe*MTU, j, 1);                
             }
         }
     }
