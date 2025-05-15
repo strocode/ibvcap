@@ -3,13 +3,26 @@
 #include <vector>
 #include <cstring>
 #include <cerrno>
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <infiniband/verbs.h>
 #include <cuda_runtime.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 
 // Define the interfaces and MTU
 const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
 const int MTU = 9000;
-const int num_frames = 1000;
+const int num_frames = 100;
 
 
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -96,21 +109,173 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
     return qp;
 }
 
-int main() {
+void ibname_to_ethname(const char* ibname, char* ethname) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/net", ibname);
+
+    DIR *dir = opendir(path);
+    if (!dir) {
+        perror("opendir");
+        return;
+    }
+
+    struct dirent *entry;
+    printf("Network interfaces for RDMA device %s:\n",  ibname);
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR && strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            printf("  %s\n", entry->d_name);
+            strcpy(ethname, entry->d_name);
+            return;
+        }
+    }
+
+    closedir(dir);
+}
+
+void get_interface_ip(const char* interface_name, struct sockaddr_in* addr) {
+    struct ifaddrs* ifaddr;
+    if (getifaddrs(&ifaddr) == -1) {
+        std::cerr << "Failed to get network interfaces: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        return;
+    }
+
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || strcmp(ifa->ifa_name, interface_name) != 0) {
+            continue;
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET) { // IPv4
+            char ip[INET_ADDRSTRLEN];
+            *addr = *(struct sockaddr_in*)ifa->ifa_addr;
+            inet_ntop(AF_INET, &addr->sin_addr, ip, INET_ADDRSTRLEN);
+            std::cout << "Interface: " << interface_name << ", IP Address: " << ip << std::endl;
+            freeifaddrs(ifaddr);
+            return;
+        }        
+    }
+
+    std::cerr << "No IPv4 address found for interface: " << interface_name << std::endl;
+    freeifaddrs(ifaddr);
+    addr = nullptr;
+}
+
+void subscribe_to_multicast(const char* interface_name, const char* multicast_ip, uint16_t udp_port) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::cerr << "Failed to create socket: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        return;
+    }
+
+    // Bind the socket to the specified port
+    struct sockaddr_in local_addr = {};
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(udp_port);
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY); // Bind to all local interfaces
+
+    if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+        std::cerr << "Failed to bind socket to port " << udp_port << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        close(sock);
+        return;
+    }
+
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+
+    // Set the multicast group address
+    mreq.imr_multiaddr.s_addr = inet_addr(multicast_ip);
+    if (mreq.imr_multiaddr.s_addr == INADDR_NONE) {
+        std::cerr << "Invalid multicast IP address: " << multicast_ip << std::endl;
+        close(sock);
+        return;
+    }
+
+    // Get the IP address of the interface
+    struct sockaddr_in addr;
+    get_interface_ip(interface_name, &addr);
+    if (addr.sin_addr.s_addr == 0) {
+        std::cerr << "Failed to get IP address for interface: " << interface_name << std::endl;
+        close(sock);
+        return;
+    }
+
+    // Set the interface for the multicast group
+    mreq.imr_interface.s_addr = addr.sin_addr.s_addr;
+
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &mreq.imr_interface.s_addr, ip_str, INET_ADDRSTRLEN);
+    std::cout << "Joining multicast group " << multicast_ip << " on interface " << ip_str << std::endl;
+
+    // Subscribe to the multicast group
+    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        std::cerr << "Failed to join multicast group: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        close(sock);
+        return;
+    }
+
+    std::cout << "Successfully subscribed " << interface_name << " to multicast group " 
+              << multicast_ip << " on port " << udp_port << std::endl;
+
+    // Close the socket
+    //close(sock);
+}
+
+int main(int argc, char* argv[]) {
     bool save_gpu = false;
+    int cuda_dev = 0;
+    int num_devices = 2; // Default value
+    int num_frames = 100; // Default value
+    int num_blocks = 1; // Number of blocks to capture
+
+    // Define long options
+    static struct option long_options[] = {
+        {"save-gpu", no_argument, nullptr, 'g'},
+        {"cuda-dev", required_argument, nullptr, 'd'},
+        {"num-devices", required_argument, nullptr, 'n'},
+        {"num-frames", required_argument, nullptr, 'f'},
+        {"num-blocks", required_argument, nullptr, 'b'},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "gd:n:f:", long_options, nullptr)) != -1) {
+        switch (opt) {
+            case 'g':
+                save_gpu = true;
+                break;
+            case 'd':
+                cuda_dev = std::atoi(optarg);
+                break;
+            case 'n':
+                num_devices = std::atoi(optarg);
+                break;
+            case 'f':
+                num_frames = std::atoi(optarg);
+                break;
+            case 'b':
+                num_blocks = std::atoi(optarg);
+                break;
+            default:
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>]" << std::endl;
+                return 1;
+        }
+    }
+
     if (save_gpu) {
-        GPUERRCHK(cudaSetDevice(0));
+        GPUERRCHK(cudaSetDevice(cuda_dev));
+        cudaDeviceProp prop;
+        GPUERRCHK(cudaGetDeviceProperties(&prop, cuda_dev));
+        std::cout << "Using GPU device: " << cuda_dev << " " << prop.name <<
+            " Supports GPUDirect? " << (prop.tccDriver ? "Yes (TCC mode)" : "No (likely WDDM or not supported)") << std::endl;
     }
 
     // Get the list of devices
-    int num_devices = 0;
     ibv_device** device_list = ibv_get_device_list(&num_devices);
     if (!device_list) {
         std::cerr << "Failed to get IB devices list: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
         return 1;
     }
 
-    num_devices = 1; // For testing, we will only use one device
+    num_devices = 2; // For testing, we will only use one device
 
     std::vector<ibv_context*> contexts(num_devices);
     std::vector<ibv_pd*> pds(num_devices);
@@ -118,13 +283,18 @@ int main() {
     std::vector<ibv_qp*> qps(num_devices);
     std::vector<std::ofstream> files(num_devices);
     std::vector<void*> gpu_buffers(num_devices);
-    std::vector<ibv_mr*> mrs(num_devices);
+    std::vector<void*> cpu_buffers(num_devices);
+    std::vector<ibv_mr*> mrs(num_devices);    
 
     // Print the list of devices
     std::cout << "Available devices:" << std::endl;
     for (int i = 0; i < num_devices; ++i) {
-        std::cout << "Device " << i << ": " << ibv_get_device_name(device_list[i]) << std::endl;
         interfaces[i] = ibv_get_device_name(device_list[i]);
+        char ethname[256];
+        ibname_to_ethname(interfaces[i], ethname);
+        std::cout << "Device " << i << ": " << interfaces[i] << " " << ethname << " " << std::endl;
+        struct sockaddr_in ipaddr;
+        get_interface_ip(ethname, &ipaddr);
     }
 
     // Free the device list
@@ -135,6 +305,21 @@ int main() {
 
         std::cout << "Opening device " << interfaces[i] << "..." << std::endl;
         contexts[i] = ibv_open_device(ibv_get_device_list(nullptr)[i]);
+
+        // Get IP
+        char ethname[256];
+        ibname_to_ethname(interfaces[i], ethname);
+        std::cout << "Device " << i << ": " << interfaces[i] << " " << ethname << " " << std::endl;
+        struct sockaddr_in ipaddr;
+        get_interface_ip(ethname, &ipaddr);
+        if (i == 0) {
+            subscribe_to_multicast(ethname, "239.17.0.1", 36001);
+            subscribe_to_multicast(ethname, "239.17.0.1", 36002);
+        } else if (i == 1) {
+            subscribe_to_multicast(ethname, "239.17.0.2", 36003);
+            subscribe_to_multicast(ethname, "239.17.0.3", 36004);
+        }
+
         if (!contexts[i]) {
             std::cerr << "Failed to open device " << interfaces[i] << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
             exit(1);
@@ -155,12 +340,16 @@ int main() {
         qps[i] = init_qp(contexts[i], pds[i], cqs[i]);
 
         // Allocate GPU memory
+        cpu_buffers[i] = malloc(num_frames * MTU);
+        memset(cpu_buffers[i], 0, num_frames * MTU);
+
         if (save_gpu) {
-            GPUERRCHK(cudaMalloManaged(&gpu_buffers[i], num_frames * MTU));
+            GPUERRCHK(cudaMalloc(&gpu_buffers[i], num_frames * MTU));
+            GPUERRCHK(cudaDeviceSynchronize()); // Ensure memory is ready
+            GPUERRCHK(cudaMemset(gpu_buffers[i], 0, num_frames * MTU));
         } else {
-            gpu_buffers[i] = malloc(num_frames * MTU);
+            gpu_buffers[i] = cpu_buffers[i];            
         }
-        memset(gpu_buffers[i], 0, num_frames * MTU);
         
 
         // Register memory region
@@ -190,22 +379,29 @@ int main() {
 
         }
     }
-    // Main loop to capture packets
-    for (int j = 0; j < num_frames; ++j) {
-        for (int i = 0; i < num_devices; ++i) {
-            
-            ibv_wc wc;
-            std::cout << "Waiting for poll completion " << std::endl;
-            while (ibv_poll_cq(cqs[i], 1, &wc) < 1) {
-                //printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
-            }
-            std::cout << " Completion polled " << std::endl;
-            if (wc.status != IBV_WC_SUCCESS) {
-                std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
-                exit(1);
-            }
 
-            files[i].write(reinterpret_cast<char*>(gpu_buffers[i]) + j * MTU, MTU);
+    for (int blk = 0; blk < num_blocks; blk++) { 
+        // Main loop to capture packets
+        for (int j = 0; j < num_frames; ++j) {
+            for (int i = 0; i < num_devices; ++i) {
+                
+                ibv_wc wc;
+                //std::cout << "Waiting for poll completion " << std::endl;
+                while (ibv_poll_cq(cqs[i], 1, &wc) < 1) { // busy wait.
+                    //printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
+                }
+                //std::cout << " Completion polled " << std::endl;
+                if (wc.status != IBV_WC_SUCCESS) {
+                    std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
+                    exit(1);
+                }
+
+                if (save_gpu) {
+                    GPUERRCHK(cudaMemcpy(cpu_buffers[i] + j*MTU, gpu_buffers[i] + j*MTU, MTU, cudaMemcpyDeviceToHost));
+                } 
+
+                files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU, MTU);
+            }
         }
     }
 
@@ -217,7 +413,11 @@ int main() {
         ibv_destroy_cq(cqs[i]);
         ibv_dealloc_pd(pds[i]);
         ibv_close_device(contexts[i]);
-        GPUERRCHK(cudaFree(gpu_buffers[i]));
+        if (save_gpu) {
+            GPUERRCHK(cudaFree(gpu_buffers[i]));
+        } else {
+            free(gpu_buffers[i]);
+        }
     }
 
     return 0;
