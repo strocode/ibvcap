@@ -23,6 +23,10 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
+#include <pcap.h>
+#include <sys/time.h> // Include for gettimeofday()
+
+
 // Define the interfaces and MTU
 const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
 const int MTU = 9000;
@@ -44,6 +48,12 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 // Define the GPUERRCHK macro
 #define GPUERRCHK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 
+/**
+ * Function to create and attach a default flow to the QP.
+ * This flow matches all packets and is used as a fallback.
+ * @param qp Pointer to the QP to attach the flow to.
+ * @return Pointer to the created flow.
+ */
 struct ibv_flow* create_and_attach_default_flow(ibv_qp* qp) {
     struct ibv_flow_attr *flow_attr;
     struct ibv_flow_spec_eth *eth_spec;
@@ -71,6 +81,64 @@ struct ibv_flow* create_and_attach_default_flow(ibv_qp* qp) {
         free(buf);
         exit(1);
     }
+    return flow;
+}
+
+/**
+ * ]Function to create a flow that matches UDP packets with a specific destination port.
+ * @param qp Pointer to the QP to attach the flow to.
+ * @param udp_dport The destination port to match.
+ */
+struct ibv_flow* create_udp_flow(ibv_qp* qp, uint16_t udp_dport) {
+    // Allocate memory for flow attributes and specs
+    size_t flow_size = sizeof(struct ibv_flow_attr) +
+                       sizeof(struct ibv_flow_spec_eth) +
+                       sizeof(struct ibv_flow_spec_ipv4) +
+                       sizeof(struct ibv_flow_spec_tcp_udp);
+    void* flow_mem = calloc(1, flow_size);
+
+    struct ibv_flow_attr* flow_attr = (struct ibv_flow_attr*)flow_mem;
+    struct ibv_flow_spec_eth* eth_spec = (struct ibv_flow_spec_eth*)(flow_attr + 1);
+    struct ibv_flow_spec_ipv4* ipv4_spec = (struct ibv_flow_spec_ipv4*)(eth_spec + 1);
+    struct ibv_flow_spec_tcp_udp* udp_spec = (struct ibv_flow_spec_tcp_udp*)(ipv4_spec + 1);
+
+    // Configure flow attributes
+    flow_attr->type = IBV_FLOW_ATTR_NORMAL;
+    flow_attr->size = flow_size;
+    flow_attr->priority = 0;
+    flow_attr->num_of_specs = 3; // ETH + IPv4 + UDP
+    flow_attr->port = 1;         // Port number (depends on your setup)
+    flow_attr->flags = 0;
+
+    // Configure Ethernet spec (match all Ethernet frames)
+    eth_spec->type = IBV_FLOW_SPEC_ETH;
+    eth_spec->size = sizeof(struct ibv_flow_spec_eth);
+    memset(&eth_spec->val, 0, sizeof(eth_spec->val));   // Match all
+    memset(&eth_spec->mask, 0, sizeof(eth_spec->mask)); // No filtering
+
+    // Configure IPv4 spec (match all IPv4 packets)
+    ipv4_spec->type = IBV_FLOW_SPEC_IPV4;
+    ipv4_spec->size = sizeof(struct ibv_flow_spec_ipv4);
+    memset(&ipv4_spec->val, 0, sizeof(ipv4_spec->val));   // Match all
+    memset(&ipv4_spec->mask, 0, sizeof(ipv4_spec->mask)); // No filtering
+
+    // Configure UDP spec (filter by destination port)
+    udp_spec->type = IBV_FLOW_SPEC_UDP;
+    udp_spec->size = sizeof(struct ibv_flow_spec_tcp_udp);
+    udp_spec->val.dst_port = htons(udp_dport); // Destination port to match
+    udp_spec->mask.dst_port = 0xFFFF;          // Exact match on destination port
+    udp_spec->val.src_port = 0;                // Match all source ports
+    udp_spec->mask.src_port = 0;               // No filtering on source port
+
+    // Attach the flow to the QP
+    struct ibv_flow* flow = ibv_create_flow(qp, flow_attr);
+    if (!flow) {
+        std::cerr << "Failed to create flow: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        free(flow_mem);
+        return nullptr;
+    }
+
+    free(flow_mem);
     return flow;
 }
 
@@ -114,7 +182,7 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
         exit(1);
     }
 
-    create_and_attach_default_flow(qp);
+    //create_and_attach_default_flow(qp);
 
     return qp;
 }
@@ -169,7 +237,15 @@ void get_interface_ip(const char* interface_name, struct sockaddr_in* addr) {
     addr = nullptr;
 }
 
-void subscribe_to_multicast(const char* interface_name, const char* multicast_ip, uint16_t udp_port) {
+void subscribe_to_multicast(const char* interface_name, ibv_qp* qp, const char* multicast_ip, uint16_t udp_port) {
+
+    // Get IP
+    char ethname[256];
+    ibname_to_ethname(interface_name, ethname);
+    std::cout << "Device " << interface_name << " " << ethname << " " << std::endl;
+    struct sockaddr_in ipaddr;
+    get_interface_ip(ethname, &ipaddr);
+
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         std::cerr << "Failed to create socket: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
@@ -199,17 +275,14 @@ void subscribe_to_multicast(const char* interface_name, const char* multicast_ip
         return;
     }
 
-    // Get the IP address of the interface
-    struct sockaddr_in addr;
-    get_interface_ip(interface_name, &addr);
-    if (addr.sin_addr.s_addr == 0) {
+    if (ipaddr.sin_addr.s_addr == 0) {
         std::cerr << "Failed to get IP address for interface: " << interface_name << std::endl;
         close(sock);
         return;
     }
 
     // Set the interface for the multicast group
-    mreq.imr_interface.s_addr = addr.sin_addr.s_addr;
+    mreq.imr_interface.s_addr = ipaddr.sin_addr.s_addr;
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &mreq.imr_interface.s_addr, ip_str, INET_ADDRSTRLEN);
@@ -292,7 +365,7 @@ int main(int argc, char* argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gd:n:f:", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "gd:n:f:b:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'g':
                 save_gpu = true;
@@ -339,7 +412,19 @@ int main(int argc, char* argv[]) {
     std::vector<std::ofstream> files(num_devices);
     std::vector<char*> gpu_buffers(num_devices);
     std::vector<char*> cpu_buffers(num_devices);
-    std::vector<ibv_mr*> mrs(num_devices);    
+    std::vector<ibv_mr*> mrs(num_devices);   
+    pcap_t* pcap = pcap_open_dead(DLT_EN10MB, MTU); // Ethernet link-layer, max packet size
+    if (!pcap) {
+        std::cerr << "Failed to open pcap handle" << std::endl;
+        return -1;
+    }
+    const char* pcap_filename = "capture.pcap";
+    pcap_dumper_t* dumper = pcap_dump_open(pcap, pcap_filename);
+    if (!dumper) {
+        std::cerr << "Failed to open pcap file: " << pcap_geterr(pcap) << std::endl;
+        pcap_close(pcap);
+        return -1;
+    }
 
     // Print the list of devices
     std::cout << "Available devices:" << std::endl;
@@ -360,20 +445,6 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Opening device " << interfaces[i] << "..." << std::endl;
         contexts[i] = ibv_open_device(ibv_get_device_list(nullptr)[i]);
-
-        // Get IP
-        char ethname[256];
-        ibname_to_ethname(interfaces[i], ethname);
-        std::cout << "Device " << i << ": " << interfaces[i] << " " << ethname << " " << std::endl;
-        struct sockaddr_in ipaddr;
-        get_interface_ip(ethname, &ipaddr);
-        if (i == 0) {
-            subscribe_to_multicast(ethname, "239.17.0.1", 36001);
-            subscribe_to_multicast(ethname, "239.17.0.1", 36002);
-        } else if (i == 1) {
-            subscribe_to_multicast(ethname, "239.17.0.2", 36003);
-            subscribe_to_multicast(ethname, "239.17.0.3", 36004);
-        }
 
         if (!contexts[i]) {
             std::cerr << "Failed to open device " << interfaces[i] << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
@@ -419,6 +490,17 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < num_devices; ++i) {
         for (int j = 0; j < num_frames; ++j) {
             post_recv(qps[i], mrs[i], gpu_buffers[i] + j*MTU, j, 1);
+        }
+    }
+
+    // Subscribe to multicast group
+    for (int i = 0; i < num_devices; ++i) {
+        if (i == 0) {
+            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.1", 36001);
+            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36002);
+        } else if (i == 1) {
+            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36003);
+            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.3", 36004);
         }
     }
 
@@ -473,12 +555,36 @@ int main(int argc, char* argv[]) {
                 } else {
                     //std::cout << "Not an IP packet" << std::endl;
                     is_codif = false;
-                }                            
+                }
+
+                bool write_all = true;
+                if (write_all) {
+                    files[i].write(packet, size_to_copy);
+                } else {
+                    // write only the CODIF header
+                    if (is_codif) {
+                        files[i].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                    }
+                }
 
                 // write only the CODIF header
                 if (is_codif) {
                     files[i].write(packet+ ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                 }
+
+                // Create a PCAP packet header
+                // Get the current time
+                struct timeval tv;
+                gettimeofday(&tv, nullptr);
+                struct pcap_pkthdr header;
+                memset(&header, 0, sizeof(header));
+                header.ts.tv_sec = tv.tv_sec; // Current timestamp (seconds)
+                header.ts.tv_usec = tv.tv_usec;            // Microseconds
+                header.caplen = size_to_copy;       // Captured length
+                header.len = wc.byte_len;          // Original packet length
+
+                // Write the packet to the PCAP file
+                pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
 
                 // send the buffer back to the QP
                 post_recv(qps[i], mrs[i], gpu_buffers[i] + jframe*MTU, j, 1);                
@@ -494,12 +600,17 @@ int main(int argc, char* argv[]) {
         ibv_destroy_cq(cqs[i]);
         ibv_dealloc_pd(pds[i]);
         ibv_close_device(contexts[i]);
+
         if (save_gpu) {
             GPUERRCHK(cudaFree(gpu_buffers[i]));
         } else {
             free(gpu_buffers[i]);
         }
     }
+
+    // Close the PCAP file
+    pcap_dump_close(dumper);
+    pcap_close(pcap);
 
     return 0;
 }
