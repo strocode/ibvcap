@@ -12,7 +12,8 @@
                 "${fileDirname}/${fileBasenameNoExtension}",
                 "-libverbs",
                 "-lcudart",
-                "-lpcap"
+                "-lpcap",
+                "-I/BIGCAT/SOFTWARE/include/"
             ],
             "options": {
                 "cwd": "${fileDirname}"

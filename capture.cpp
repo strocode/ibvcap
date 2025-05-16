@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <cassert>
 
 #include <netinet/ether.h>
 #include <netinet/ip.h>
@@ -25,6 +26,7 @@
 
 #include <pcap.h>
 #include <sys/time.h> // Include for gettimeofday()
+#include <codifio.h>
 
 
 // Define the interfaces and MTU
@@ -309,7 +311,8 @@ void subscribe_to_multicast(const char* interface_name, ibv_qp* qp, const char* 
 void parse_packet(char *packet, 
     struct ether_header** eth,
                    struct ip** ip_hdr, 
-                   struct udphdr** udp_hdr) {
+                   struct udphdr** udp_hdr,
+                    struct codif_header** codif_hdr) {
     *eth = (struct ether_header *)packet;
     *ip_hdr = nullptr;
     *udp_hdr = nullptr;
@@ -328,6 +331,8 @@ void parse_packet(char *packet,
 
     int ip_hdr_len = (*ip_hdr)->ip_hl * 4;
     *udp_hdr = (struct udphdr *)(packet + sizeof(struct ether_header) + ip_hdr_len);
+
+    *codif_hdr = (struct codif_header *)(packet + sizeof(struct ether_header) + ip_hdr_len + UDP_HDR_SIZE);
 
     //printf("UDP Source Port: %u\n", ntohs((*udp_hdr)->uh_sport));
     //printf("UDP Dest Port  : %u\n", ntohs((*udp_hdr)->uh_dport));
@@ -350,10 +355,34 @@ void post_recv(ibv_qp* qp, ibv_mr* mr, void* buffer, uint64_t id, int num_frames
         exit(1);
     }
 }
+void print_device_list()
+{
+    int num_devices = 0;
+    // Get the list of devices
+    ibv_device** device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) {
+        std::cerr << "Failed to get IB devices list: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        exit(-1);
+    }
+    
+    // Print the list of devices
+    std::cout << "Available devices:" << std::endl;
+    for (int i = 0; i < num_devices; ++i) {
+        interfaces[i] = ibv_get_device_name(device_list[i]);
+        char ethname[256];
+        ibname_to_ethname(interfaces[i], ethname);
+        std::cout << "Device " << i << ": " << interfaces[i] << " " << ethname << " " << std::endl;
+        struct sockaddr_in ipaddr;
+        get_interface_ip(ethname, &ipaddr);
+    }
+
+    // Free the device list
+    ibv_free_device_list(device_list);
+}
 int main(int argc, char* argv[]) {
     bool save_gpu = false;
     int cuda_dev = 0;
-    int num_devices = 2; // Default value
+    int num_devices = 1; // Default value
     int num_frames = 100; // Default value
     int num_blocks = 1; // Number of blocks to capture
     // FILE* f = fopen("mlx5_0.raw", "r");
@@ -407,14 +436,6 @@ int main(int argc, char* argv[]) {
             " Supports GPUDirect? " << (prop.tccDriver ? "Yes (TCC mode)" : "No (likely WDDM or not supported)") << std::endl;
     }
 
-    // Get the list of devices
-    ibv_device** device_list = ibv_get_device_list(&num_devices);
-    if (!device_list) {
-        std::cerr << "Failed to get IB devices list: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
-        return 1;
-    }
-
-    num_devices = 2; // For testing, we will only use one device
 
     std::vector<ibv_context*> contexts(num_devices);
     std::vector<ibv_pd*> pds(num_devices);
@@ -424,6 +445,8 @@ int main(int argc, char* argv[]) {
     std::vector<char*> gpu_buffers(num_devices);
     std::vector<char*> cpu_buffers(num_devices);
     std::vector<ibv_mr*> mrs(num_devices);   
+
+    std::vector<uint64_t> frame_numbers(6*8);
     pcap_t* pcap = pcap_open_dead(DLT_EN10MB, MTU); // Ethernet link-layer, max packet size
     if (!pcap) {
         std::cerr << "Failed to open pcap handle" << std::endl;
@@ -437,19 +460,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Print the list of devices
-    std::cout << "Available devices:" << std::endl;
-    for (int i = 0; i < num_devices; ++i) {
-        interfaces[i] = ibv_get_device_name(device_list[i]);
-        char ethname[256];
-        ibname_to_ethname(interfaces[i], ethname);
-        std::cout << "Device " << i << ": " << interfaces[i] << " " << ethname << " " << std::endl;
-        struct sockaddr_in ipaddr;
-        get_interface_ip(ethname, &ipaddr);
-    }
-
-    // Free the device list
-    ibv_free_device_list(device_list);
+    print_device_list();
 
     for (int i = 0; i < num_devices; ++i) {
         files[i].open(std::string(interfaces[i]) + ".raw", std::ios::binary);
@@ -476,7 +487,7 @@ int main(int argc, char* argv[]) {
 
         qps[i] = init_qp(contexts[i], pds[i], cqs[i]);
 
-        // Allocate GPU memory
+        // Allocate CPU memory
         cpu_buffers[i] = (char*) malloc(num_frames * MTU);
         memset(cpu_buffers[i], 0, num_frames * MTU);
 
@@ -508,10 +519,10 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < num_devices; ++i) {
         if (i == 0) {
             subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.1", 36001);
-            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36002);
+            //subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36002);
         } else if (i == 1) {
             subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36003);
-            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.3", 36004);
+            //subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.3", 36004);
         }
     }
 
@@ -537,7 +548,8 @@ int main(int argc, char* argv[]) {
                 size_to_copy = TOTAL_HDR_SIZE; // Don't copy all the data
                 if (save_gpu) {
                     GPUERRCHK(cudaMemcpy(cpu_buffers[i] + jframe*MTU, gpu_buffers[i] + jframe*MTU, size_to_copy, cudaMemcpyDeviceToHost));
-                } 
+                }
+
 
                 // Write whole packet to file
                 // files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU , MTU);
@@ -546,29 +558,41 @@ int main(int argc, char* argv[]) {
                 
                 //std::cout << "Byte len" << wc.byte_len << " is codif " << is_codif << std::endl;
 
-                char* packet = reinterpret_cast<char*>(cpu_buffers[i]) + jframe * MTU;
+                char* packet = cpu_buffers[i] + jframe * MTU;
                 struct ether_header* eth ;
                 struct ip* ip_hdr ;
                 struct udphdr* uudp_hdr ;
-                parse_packet(packet, &eth, &ip_hdr, &uudp_hdr);
+                struct codif_header* codif_hdr;
+                parse_packet(packet, &eth, &ip_hdr, &uudp_hdr, &codif_hdr);
                 bool is_codif;
+
                             
                 if (uudp_hdr != nullptr) {
                     auto dport = (uudp_hdr->uh_dport);
-                    /*&printf("eth 0x%x 0x%x 0x%x 0x%x %u %d\n", 
-                        ntohs(eth->ether_type), ETHERTYPE_IP, ip_hdr->ip_p,
-                         IPPROTO_UDP, dport, wc.byte_len);
-                     **/
                     is_codif = wc.byte_len == 8298; // My dport parsing is no good. && dport > 36000; // There are more rigorous checks, but this is easy.
-
-                    //std::cout << "UDP Source Port: " << ntohs(uudp_hdr->uh_sport) << std::endl;
-                    //std::cout << "UDP Dest Port  : " << ntohs(uudp_hdr->uh_dport) << std::endl;
                 } else {
                     //std::cout << "Not an IP packet" << std::endl;
                     is_codif = false;
                 }
 
-                bool write_all = true;
+                //printf("blk =%d dev=%d j=%d jframe=%d nbytes=%d codif?=%d sync=%x %d-%d-%d %d\n", blk, i, j, jframe, wc.byte_len, is_codif,
+                 //codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid, codif_hdr->threadid, codif_hdr->frame);
+                int antid = codif_hdr->groupid - 257;
+                assert(antid >= 0 && antid < 6);
+
+                int totalid = antid + 6*codif_hdr->threadid;
+                // Only track for device = i
+                if (i == 0) { 
+                    if (frame_numbers[totalid] == 0) {
+                        frame_numbers[totalid] = codif_hdr->frame;
+                    }
+                    if (frame_numbers[totalid] != codif_hdr->frame) {
+                        std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
+                    }
+                    frame_numbers[totalid] = codif_hdr->frame + 1;
+                }
+
+                bool write_all = false;
                 if (write_all) {
                     files[i].write(packet, size_to_copy);
                 } else {
@@ -576,11 +600,6 @@ int main(int argc, char* argv[]) {
                     if (is_codif) {
                         files[i].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                     }
-                }
-
-                // write only the CODIF header
-                if (is_codif) {
-                    files[i].write(packet+ ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                 }
 
                 // Create a PCAP packet header
