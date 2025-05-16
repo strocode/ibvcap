@@ -1,3 +1,10 @@
+# temporary capture file
+capture.pcap
+
+# not sure why this 2 file gets created 
+2 
+
+
 
 # captured files
 *.raw
