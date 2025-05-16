@@ -295,6 +295,9 @@ void subscribe_to_multicast(const char* interface_name, ibv_qp* qp, const char* 
         return;
     }
 
+    // now attach to flow
+    create_udp_flow(qp, udp_port);
+
     std::cout << "Successfully subscribed " << interface_name << " to multicast group " 
               << multicast_ip << " on port " << udp_port << std::endl;
 
@@ -324,7 +327,7 @@ void parse_packet(char *packet,
     }
 
     int ip_hdr_len = (*ip_hdr)->ip_hl * 4;
-    *udp_hdr = (struct udphdr *)((char *)ip_hdr + ip_hdr_len);
+    *udp_hdr = (struct udphdr *)(packet + sizeof(struct ether_header) + ip_hdr_len);
 
     //printf("UDP Source Port: %u\n", ntohs((*udp_hdr)->uh_sport));
     //printf("UDP Dest Port  : %u\n", ntohs((*udp_hdr)->uh_dport));
@@ -353,6 +356,14 @@ int main(int argc, char* argv[]) {
     int num_devices = 2; // Default value
     int num_frames = 100; // Default value
     int num_blocks = 1; // Number of blocks to capture
+    // FILE* f = fopen("mlx5_0.raw", "r");
+    // char packet[1024];
+    // fread(packet, 1, sizeof(packet), f);
+    // struct ether_header* eth ;
+    // struct ip* ip_hdr ;
+    // struct udphdr* uudp_hdr ;
+    // parse_packet(packet, &eth, &ip_hdr, &uudp_hdr);
+
 
     // Define long options
     static struct option long_options[] = {
