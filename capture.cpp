@@ -40,6 +40,19 @@ const int UDP_HDR_SIZE = 8; // UDP header size
 const int CODIF_HDR_SIZE = 64; // CODIF header size
 const int TOTAL_HDR_SIZE = ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE + CODIF_HDR_SIZE;
 
+// Define a structure to hold multicast IP address and port
+struct MulticastGroup {
+    char ip[16];       // Multicast IP address (IPv4, max length 15 + null terminator)
+    uint16_t port;     // Port number
+};
+
+// Pre-defined list of multicast groups
+const MulticastGroup multicast_groups[] = {
+    {"239.17.0.1", 36001},
+    {"239.17.0.2", 36002},
+    {"239.17.0.3", 36003},
+    {"239.17.0.4", 36004}
+};
 
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
     if (code != cudaSuccess) {
@@ -385,6 +398,9 @@ int main(int argc, char* argv[]) {
     int num_devices = 1; // Default value
     int num_frames = 100; // Default value
     int num_blocks = 1; // Number of blocks to capture
+    int num_muliticast_groups = 1;
+    int num_sge = 1; // Number of scatter gather entries per work request
+    bool verbose = false;
     // FILE* f = fopen("mlx5_0.raw", "r");
     // char packet[1024];
     // fread(packet, 1, sizeof(packet), f);
@@ -401,11 +417,15 @@ int main(int argc, char* argv[]) {
         {"num-devices", required_argument, nullptr, 'n'},
         {"num-frames", required_argument, nullptr, 'f'},
         {"num-blocks", required_argument, nullptr, 'b'},
+        {"num-multicast-groups", required_argument, nullptr, 'm'},
+        {"num-sge", required_argument, nullptr, 's'},
+        {"verbose", no_argument, nullptr, 'v'},
+
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gd:n:f:b:", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:v", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'g':
                 save_gpu = true;
@@ -422,8 +442,17 @@ int main(int argc, char* argv[]) {
             case 'b':
                 num_blocks = std::atoi(optarg);
                 break;
+            case 'm':
+                num_muliticast_groups = std::atoi(optarg);
+                break;
+            case 'v':
+                verbose = true;
+                break;
+            case 's':
+                num_sge = std::atoi(optarg);
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>]" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>]" << std::endl;
                 return 1;
         }
     }
@@ -436,17 +465,6 @@ int main(int argc, char* argv[]) {
             " Supports GPUDirect? " << (prop.tccDriver ? "Yes (TCC mode)" : "No (likely WDDM or not supported)") << std::endl;
     }
 
-
-    std::vector<ibv_context*> contexts(num_devices);
-    std::vector<ibv_pd*> pds(num_devices);
-    std::vector<ibv_cq*> cqs(num_devices);
-    std::vector<ibv_qp*> qps(num_devices);
-    std::vector<std::ofstream> files(num_devices);
-    std::vector<char*> gpu_buffers(num_devices);
-    std::vector<char*> cpu_buffers(num_devices);
-    std::vector<ibv_mr*> mrs(num_devices);   
-
-    std::vector<uint64_t> frame_numbers(6*8);
     pcap_t* pcap = pcap_open_dead(DLT_EN10MB, MTU); // Ethernet link-layer, max packet size
     if (!pcap) {
         std::cerr << "Failed to open pcap handle" << std::endl;
@@ -461,111 +479,111 @@ int main(int argc, char* argv[]) {
     }
 
     print_device_list();
+    
+    std::vector<ibv_context*> contexts(num_devices);
+    std::vector<ibv_pd*> pds(num_muliticast_groups);
+    std::vector<ibv_cq*> cqs(num_muliticast_groups);
+    std::vector<ibv_qp*> qps(num_muliticast_groups);
+    std::vector<std::ofstream> files(num_muliticast_groups);
+    std::vector<char*> gpu_buffers(num_muliticast_groups);
+    std::vector<char*> cpu_buffers(num_muliticast_groups);
+    std::vector<ibv_mr*> mrs(num_muliticast_groups);
+    std::vector<uint64_t> frame_numbers(6*8);
 
-    for (int i = 0; i < num_devices; ++i) {
-        files[i].open(std::string(interfaces[i]) + ".raw", std::ios::binary);
 
-        std::cout << "Opening device " << interfaces[i] << "..." << std::endl;
-        contexts[i] = ibv_open_device(ibv_get_device_list(nullptr)[i]);
+    for (int idevice = 0; idevice < num_devices; idevice++) {
+        std::cout << "Opening device " << idevice << interfaces[idevice] << "..." << std::endl;
 
-        if (!contexts[i]) {
-            std::cerr << "Failed to open device " << interfaces[i] << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+        contexts[idevice] = ibv_open_device(ibv_get_device_list(nullptr)[idevice]);
+        if (!contexts[idevice]) {
+            std::cerr << "Failed to open device " << interfaces[idevice] << ": " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
             exit(1);
         }
+    }
 
-        pds[i] = ibv_alloc_pd(contexts[i]);
-        if (!pds[i]) {
+    for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
+        int idevice = igroup % num_devices;
+
+        files[igroup].open(std::string(multicast_groups[igroup].ip) + ".raw", std::ios::binary);
+
+        pds[igroup] = ibv_alloc_pd(contexts[idevice]);
+        if (!pds[igroup]) {
             std::cerr << "Failed to allocate PD: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
             exit(1);
         }
 
-        cqs[i] = ibv_create_cq(contexts[i], num_frames, nullptr, nullptr, 0);
-        if (!cqs[i]) {
+        cqs[igroup] = ibv_create_cq(contexts[idevice], num_frames, nullptr, nullptr, 0);
+        if (!cqs[igroup]) {
             std::cerr << "Failed to create CQ: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
             exit(1);
         }
 
-        qps[i] = init_qp(contexts[i], pds[i], cqs[i]);
+        qps[igroup] = init_qp(contexts[idevice], pds[igroup], cqs[igroup]);
 
         // Allocate CPU memory
-        cpu_buffers[i] = (char*) malloc(num_frames * MTU);
-        memset(cpu_buffers[i], 0, num_frames * MTU);
+        cpu_buffers[igroup] = (char*) malloc(num_frames * MTU);
+        memset(cpu_buffers[igroup], 0, num_frames * MTU);
 
         if (save_gpu) {
-            GPUERRCHK(cudaMalloc(&gpu_buffers[i], num_frames * MTU));
+            GPUERRCHK(cudaMalloc(&gpu_buffers[igroup], num_frames * MTU));
             GPUERRCHK(cudaDeviceSynchronize()); // Ensure memory is ready
-            GPUERRCHK(cudaMemset(gpu_buffers[i], 0, num_frames * MTU));
+            GPUERRCHK(cudaMemset(gpu_buffers[igroup], 0, num_frames * MTU));
         } else {
-            gpu_buffers[i] = cpu_buffers[i];            
+            gpu_buffers[igroup] = cpu_buffers[igroup];            
         }
         
-
         // Register memory region
-        mrs[i] = ibv_reg_mr(pds[i], gpu_buffers[i], num_frames * MTU, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        if (!mrs[i]) {
+        mrs[igroup] = ibv_reg_mr(pds[igroup], gpu_buffers[igroup], num_frames * MTU, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        if (!mrs[igroup]) {
             std::cerr << "Failed to register memory region: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
             exit(1);
         }
-    }
 
-    // Post recieve work requests
-    for (int i = 0; i < num_devices; ++i) {
         for (int j = 0; j < num_frames; ++j) {
-            post_recv(qps[i], mrs[i], gpu_buffers[i] + j*MTU, j, 1);
+            post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + j*MTU, j, 1);
         }
+
+        subscribe_to_multicast(interfaces[idevice], qps[igroup], multicast_groups[igroup].ip, multicast_groups[igroup].port);
     }
 
-    // Subscribe to multicast group
-    for (int i = 0; i < num_devices; ++i) {
-        if (i == 0) {
-            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.1", 36001);
-            //subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36002);
-        } else if (i == 1) {
-            subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.2", 36003);
-            //subscribe_to_multicast(interfaces[i], qps[i], "239.17.0.3", 36004);
-        }
-    }
-
+    uint64_t busy_wait = 0;
+    uint64_t total_bytes = 0;
+    uint64_t total_packets = 0;
     for (int blk = 0; blk < num_blocks; blk++) { 
         // Main loop to capture packets
-        for (int j = 0; j < num_frames; ++j) {
-            for (int i = 0; i < num_devices; ++i) {
+        for (int j = 0; j < num_frames; ++j) {        
+            for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
                 
                 ibv_wc wc;
                 //std::cout << "Waiting for poll completion " << std::endl;
-                while (ibv_poll_cq(cqs[i], 1, &wc) < 1) { // busy wait.
-                    //printf("Header: 0x%x\n", *(uint32_t*)gpu_buffers[i]);
+                while (ibv_poll_cq(cqs[igroup], 1, &wc) < 1) { // busy wait.
+                    busy_wait += 1;
                 }
                 //std::cout << " Completion polled " << std::endl;
                 if (wc.status != IBV_WC_SUCCESS) {
                     std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
                     exit(1);
                 }
-                auto size_to_copy = wc.byte_len;
+
+                auto size_to_copy = wc.byte_len;                
                 auto jframe = wc.wr_id; // ID - set to the frame number where the data was written
+
+                total_bytes += wc.byte_len;
+                total_packets += 1;
                 
                 // size_to_copy = MTU; // Copy everything back
                 size_to_copy = TOTAL_HDR_SIZE; // Don't copy all the data
                 if (save_gpu) {
-                    GPUERRCHK(cudaMemcpy(cpu_buffers[i] + jframe*MTU, gpu_buffers[i] + jframe*MTU, size_to_copy, cudaMemcpyDeviceToHost));
+                    GPUERRCHK(cudaMemcpy(cpu_buffers[igroup] + jframe*MTU, gpu_buffers[igroup] + jframe*MTU, size_to_copy, cudaMemcpyDeviceToHost));
                 }
-
-
-                // Write whole packet to file
-                // files[i].write(reinterpret_cast<char*>(cpu_buffers[i]) + j * MTU , MTU);
-                
-                // Only write the CODIF header
-                
-                //std::cout << "Byte len" << wc.byte_len << " is codif " << is_codif << std::endl;
-
-                char* packet = cpu_buffers[i] + jframe * MTU;
+            
+                char* packet = cpu_buffers[igroup] + jframe * MTU;
                 struct ether_header* eth ;
                 struct ip* ip_hdr ;
                 struct udphdr* uudp_hdr ;
                 struct codif_header* codif_hdr;
                 parse_packet(packet, &eth, &ip_hdr, &uudp_hdr, &codif_hdr);
                 bool is_codif;
-
                             
                 if (uudp_hdr != nullptr) {
                     auto dport = (uudp_hdr->uh_dport);
@@ -574,15 +592,20 @@ int main(int argc, char* argv[]) {
                     //std::cout << "Not an IP packet" << std::endl;
                     is_codif = false;
                 }
-
-                //printf("blk =%d dev=%d j=%d jframe=%d nbytes=%d codif?=%d sync=%x %d-%d-%d %d\n", blk, i, j, jframe, wc.byte_len, is_codif,
-                 //codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid, codif_hdr->threadid, codif_hdr->frame);
+                
+                if (verbose) {
+                    printf("blk =%d igroup=%d j=%d jframe=%d nbytes=%d codif?=%d sync=%x %d-%d-%d %d\n",
+                         blk, igroup, j, jframe, wc.byte_len, is_codif,
+                        codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
+                        codif_hdr->threadid, codif_hdr->frame);
+                }
+                 //
                 int antid = codif_hdr->groupid - 257;
                 assert(antid >= 0 && antid < 6);
 
                 int totalid = antid + 6*codif_hdr->threadid;
                 // Only track for device = i
-                if (i == 0) { 
+                if (igroup == 0) { 
                     if (frame_numbers[totalid] == 0) {
                         frame_numbers[totalid] = codif_hdr->frame;
                     }
@@ -594,11 +617,11 @@ int main(int argc, char* argv[]) {
 
                 bool write_all = false;
                 if (write_all) {
-                    files[i].write(packet, size_to_copy);
+                    files[igroup].write(packet, size_to_copy);
                 } else {
                     // write only the CODIF header
                     if (is_codif) {
-                        files[i].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                        files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                     }
                 }
 
@@ -617,25 +640,33 @@ int main(int argc, char* argv[]) {
                 pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
 
                 // send the buffer back to the QP
-                post_recv(qps[i], mrs[i], gpu_buffers[i] + jframe*MTU, j, 1);                
+                post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + jframe*MTU, j, 1);                
             }
         }
     }
 
+    std::cout << "Total bytes: " << total_bytes << std::endl;
+    std::cout << "Total packets: " << total_packets << std::endl;
+    std::cout << "Busy wait: " << busy_wait << std::endl;
+    std::cout << "Average bytes per packet: " << (total_bytes / total_packets) << std::endl;
+
     // Cleanup
-    for (int i = 0; i < num_devices; ++i) {
+    for (int i = 0; i < num_muliticast_groups; ++i) {
         files[i].close();
         ibv_dereg_mr(mrs[i]);
         ibv_destroy_qp(qps[i]);
         ibv_destroy_cq(cqs[i]);
         ibv_dealloc_pd(pds[i]);
-        ibv_close_device(contexts[i]);
 
         if (save_gpu) {
             GPUERRCHK(cudaFree(gpu_buffers[i]));
         } else {
             free(gpu_buffers[i]);
         }
+    }
+
+    for (int i = 0; i < num_devices; i++) {
+        ibv_close_device(contexts.at(i));
     }
 
     // Close the PCAP file
