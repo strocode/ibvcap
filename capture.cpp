@@ -31,7 +31,7 @@
 
 // Define the interfaces and MTU
 const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
-const int MTU = 9000;
+const int MTU = (9000/64 + 1) * 64; // 9000 bytes, aligned to 64 bytes
 const int num_frames = 100;
 
 const int ETH_HDR_SIZE = 14; // Ethernet header size
@@ -162,7 +162,7 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
     ibv_qp_init_attr qp_init_attr = {};
     qp_init_attr.send_cq = cq;
     qp_init_attr.recv_cq = cq;
-    qp_init_attr.cap.max_send_wr = num_frames;
+    qp_init_attr.cap.max_send_wr = 1;
     qp_init_attr.cap.max_recv_wr = num_frames;
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
@@ -213,7 +213,7 @@ void ibname_to_ethname(const char* ibname, char* ethname) {
     }
 
     struct dirent *entry;
-    printf("Network interfaces for RDMA device %s:\n",  ibname);
+    //printf("Network interfaces for RDMA device %s:\n",  ibname);
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR && strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
             printf("  %s\n", entry->d_name);
@@ -241,7 +241,7 @@ void get_interface_ip(const char* interface_name, struct sockaddr_in* addr) {
             char ip[INET_ADDRSTRLEN];
             *addr = *(struct sockaddr_in*)ifa->ifa_addr;
             inet_ntop(AF_INET, &addr->sin_addr, ip, INET_ADDRSTRLEN);
-            std::cout << "Interface: " << interface_name << ", IP Address: " << ip << std::endl;
+            //std::cout << "Interface: " << interface_name << ", IP Address: " << ip << std::endl;
             freeifaddrs(ifaddr);
             return;
         }        
@@ -257,7 +257,7 @@ void subscribe_to_multicast(const char* interface_name, ibv_qp* qp, const char* 
     // Get IP
     char ethname[256];
     ibname_to_ethname(interface_name, ethname);
-    std::cout << "Device " << interface_name << " " << ethname << " " << std::endl;
+    //std::cout << "Device " << interface_name << " " << ethname << " " << std::endl;
     struct sockaddr_in ipaddr;
     get_interface_ip(ethname, &ipaddr);
 
@@ -543,21 +543,31 @@ int main(int argc, char* argv[]) {
             post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + j*MTU, j, 1);
         }
 
-        subscribe_to_multicast(interfaces[idevice], qps[igroup], multicast_groups[igroup].ip, multicast_groups[igroup].port);
     }
 
     uint64_t busy_wait = 0;
     uint64_t total_bytes = 0;
     uint64_t total_packets = 0;
+    uint64_t num_mismatches = 0;
+
+    // We'll all ready - now subscribe
+    for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
+        int idevice = igroup % num_devices;
+        subscribe_to_multicast(interfaces[idevice], qps[igroup], 
+            multicast_groups[igroup].ip, multicast_groups[igroup].port);
+    }
+
     for (int blk = 0; blk < num_blocks; blk++) { 
         // Main loop to capture packets
-        for (int j = 0; j < num_frames; ++j) {        
+        int j = 0;
+        while (j < num_frames) {
             for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
                 
                 ibv_wc wc;
                 //std::cout << "Waiting for poll completion " << std::endl;
-                while (ibv_poll_cq(cqs[igroup], 1, &wc) < 1) { // busy wait.
+                if (ibv_poll_cq(cqs[igroup], 1, &wc) < 1) { // busy wait.
                     busy_wait += 1;
+                    continue;
                 }
                 //std::cout << " Completion polled " << std::endl;
                 if (wc.status != IBV_WC_SUCCESS) {
@@ -610,7 +620,12 @@ int main(int argc, char* argv[]) {
                         frame_numbers[totalid] = codif_hdr->frame;
                     }
                     if (frame_numbers[totalid] != codif_hdr->frame) {
+                        printf("blk =%d igroup=%d j=%d jframe=%d nbytes=%d codif?=%d sync=%x %d-%d-%d %d ",
+                            blk, igroup, j, jframe, wc.byte_len, is_codif,
+                            codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
+                            codif_hdr->threadid, codif_hdr->frame);
                         std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
+                        num_mismatches += 1;
                     }
                     frame_numbers[totalid] = codif_hdr->frame + 1;
                 }
@@ -621,7 +636,7 @@ int main(int argc, char* argv[]) {
                 } else {
                     // write only the CODIF header
                     if (is_codif) {
-                        files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                        //files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                     }
                 }
 
@@ -640,7 +655,10 @@ int main(int argc, char* argv[]) {
                 pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
 
                 // send the buffer back to the QP
-                post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + jframe*MTU, j, 1);                
+                post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + jframe*MTU, jframe, 1);  
+                
+                // Increment count 
+                j += 1;
             }
         }
     }
@@ -649,6 +667,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Total packets: " << total_packets << std::endl;
     std::cout << "Busy wait: " << busy_wait << std::endl;
     std::cout << "Average bytes per packet: " << (total_bytes / total_packets) << std::endl;
+    std::cout << "Busy wait / packet " << (busy_wait / total_packets) << std::endl;
+    std::cout << "Num mismatches " << num_mismatches << std::endl;
+
 
     // Cleanup
     for (int i = 0; i < num_muliticast_groups; ++i) {
