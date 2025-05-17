@@ -1,5 +1,9 @@
 # temporary capture file
-capture.pcap
+*.pcap
+
+# logs
+*.log
+
 
 # not sure why this 2 file gets created 
 2 
