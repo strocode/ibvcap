@@ -4,6 +4,9 @@
 # logs
 *.log
 
+# core files
+core*
+
 
 # not sure why this 2 file gets created 
 2 
