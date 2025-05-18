@@ -392,6 +392,13 @@ void print_device_list()
     // Free the device list
     ibv_free_device_list(device_list);
 }
+// Define the format enum
+enum class Format {
+    NONE,      // No format specified
+    RAW,       // Write raw packets
+    CODIFHDR   // Write only CODIF headers
+};
+
 int main(int argc, char* argv[]) {
     bool save_gpu = false;
     int cuda_dev = 0;
@@ -401,14 +408,7 @@ int main(int argc, char* argv[]) {
     int num_muliticast_groups = 1;
     int num_sge = 1; // Number of scatter gather entries per work request
     bool verbose = false;
-    // FILE* f = fopen("mlx5_0.raw", "r");
-    // char packet[1024];
-    // fread(packet, 1, sizeof(packet), f);
-    // struct ether_header* eth ;
-    // struct ip* ip_hdr ;
-    // struct udphdr* uudp_hdr ;
-    // parse_packet(packet, &eth, &ip_hdr, &uudp_hdr);
-
+    Format format = Format::NONE; // Default: no format specified
 
     // Define long options
     static struct option long_options[] = {
@@ -420,12 +420,12 @@ int main(int argc, char* argv[]) {
         {"num-multicast-groups", required_argument, nullptr, 'm'},
         {"num-sge", required_argument, nullptr, 's'},
         {"verbose", no_argument, nullptr, 'v'},
-
+        {"format", required_argument, nullptr, 'F'}, // New format option
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:v", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:vF:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'g':
                 save_gpu = true;
@@ -445,14 +445,24 @@ int main(int argc, char* argv[]) {
             case 'm':
                 num_muliticast_groups = std::atoi(optarg);
                 break;
-            case 'v':
-                verbose = true;
-                break;
             case 's':
                 num_sge = std::atoi(optarg);
                 break;
+            case 'v':
+                verbose = true;
+                break;
+            case 'F': // Handle the format option
+                if (strcmp(optarg, "raw") == 0) {
+                    format = Format::RAW;
+                } else if (strcmp(optarg, "codifhdr") == 0) {
+                    format = Format::CODIFHDR;
+                } else {
+                    std::cerr << "Invalid format: " << optarg << ". Supported formats are 'raw' and 'codifhdr'." << std::endl;
+                    return 1;
+                }
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>]" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>] [--format <raw|codifhdr>]" << std::endl;
                 return 1;
         }
     }
@@ -630,29 +640,28 @@ int main(int argc, char* argv[]) {
                     frame_numbers[totalid] = codif_hdr->frame + 1;
                 }
 
-                bool write_all = false;
-                if (write_all) {
+                // Write based on the specified format
+                if (format == Format::RAW) {
                     files[igroup].write(packet, size_to_copy);
-                } else {
-                    // write only the CODIF header
-                    if (is_codif) {
-                        //files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
-                    }
+                } else if (format == Format::CODIFHDR && is_codif) {
+                    files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                 }
 
-                // Create a PCAP packet header
-                // Get the current time
-                struct timeval tv;
-                gettimeofday(&tv, nullptr);
-                struct pcap_pkthdr header;
-                memset(&header, 0, sizeof(header));
-                header.ts.tv_sec = tv.tv_sec; // Current timestamp (seconds)
-                header.ts.tv_usec = tv.tv_usec;            // Microseconds
-                header.caplen = size_to_copy;       // Captured length
-                header.len = wc.byte_len;          // Original packet length
+                // Write to PCAP only if format is specified
+                if (format != Format::NONE) {
+                    // Create a PCAP packet header
+                    struct timeval tv;
+                    gettimeofday(&tv, nullptr);
+                    struct pcap_pkthdr header;
+                    memset(&header, 0, sizeof(header));
+                    header.ts.tv_sec = tv.tv_sec; // Current timestamp (seconds)
+                    header.ts.tv_usec = tv.tv_usec; // Microseconds
+                    header.caplen = size_to_copy; // Captured length
+                    header.len = wc.byte_len; // Original packet length
 
-                // Write the packet to the PCAP file
-                pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
+                    // Write the packet to the PCAP file
+                    pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
+                }
 
                 // send the buffer back to the QP
                 post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup] + jframe*MTU, jframe, 1);  
