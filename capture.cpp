@@ -165,7 +165,7 @@ ibv_qp* init_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
     qp_init_attr.cap.max_send_wr = 1;
     qp_init_attr.cap.max_recv_wr = num_frames;
     qp_init_attr.cap.max_send_sge = 1;
-    qp_init_attr.cap.max_recv_sge = 1;
+    qp_init_attr.cap.max_recv_sge = 2;
     qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
 
     ibv_qp* qp = ibv_create_qp(pd, &qp_init_attr);
@@ -351,16 +351,31 @@ void parse_packet(char *packet,
     //printf("UDP Dest Port  : %u\n", ntohs((*udp_hdr)->uh_dport));
 }
 
-void post_recv(ibv_qp* qp, ibv_mr* mr, char* buffer, uint32_t frame_id, uint32_t qpid) {
-    ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uintptr_t>(buffer + frame_id * MTU);
-    sge.length = MTU;
-    sge.lkey = mr->lkey;
+void post_recv(ibv_qp* qp, ibv_mr* header_mr, ibv_mr* mr, char* header_buffer, char* data_buffer, 
+    uint32_t frame_id, uint32_t qpid, bool separate_header) {
+    ibv_sge sge[2] = {}; // Array to hold up to 2 SGEs
+
+    if (separate_header) {
+        // First SGE: Headers in the header buffer
+        sge[0].addr = reinterpret_cast<uintptr_t>(header_buffer + frame_id * MTU);
+        sge[0].length = TOTAL_HDR_SIZE; // Length of the headers
+        sge[0].lkey = header_mr->lkey;
+
+        // Second SGE: Rest of the packet in the data buffer
+        sge[1].addr = reinterpret_cast<uintptr_t>(data_buffer + frame_id * MTU );
+        sge[1].length = MTU - TOTAL_HDR_SIZE; // Remaining packet size
+        sge[1].lkey = mr->lkey;
+    } else {
+        // Single SGE: Entire packet in the data buffer
+        sge[0].addr = reinterpret_cast<uintptr_t>(data_buffer + frame_id * MTU);
+        sge[0].length = MTU; // Full packet size
+        sge[0].lkey = mr->lkey;
+    }
 
     ibv_recv_wr wr = {};
-    wr.wr_id = static_cast<uint64_t>(qpid) << 32 | frame_id;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
+    wr.wr_id = static_cast<uint64_t>(qpid) << 32 | frame_id; // Encode QP ID and frame ID
+    wr.sg_list = sge;
+    wr.num_sge = separate_header ? 2 : 1; // Use 2 SGEs if save_gpu is enabled, otherwise 1
 
     ibv_recv_wr* bad_wr;
     if (ibv_post_recv(qp, &wr, &bad_wr)) {
@@ -498,6 +513,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::ofstream> files(num_muliticast_groups);
     std::vector<char*> gpu_buffers(num_muliticast_groups);
     std::vector<char*> cpu_buffers(num_muliticast_groups);
+    std::vector<ibv_mr*> header_mrs(num_muliticast_groups);
     std::vector<ibv_mr*> mrs(num_muliticast_groups);
     std::vector<uint64_t> frame_numbers(6*8);
 
@@ -539,6 +555,10 @@ int main(int argc, char* argv[]) {
             GPUERRCHK(cudaMalloc(&gpu_buffers[igroup], num_frames * MTU));
             GPUERRCHK(cudaDeviceSynchronize()); // Ensure memory is ready
             GPUERRCHK(cudaMemset(gpu_buffers[igroup], 0, num_frames * MTU));
+            // Also make the CPU buffer a MR
+            header_mrs[igroup] = ibv_reg_mr(pds[igroup], cpu_buffers[igroup], num_frames * MTU,
+                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+
         } else {
             gpu_buffers[igroup] = cpu_buffers[igroup];
         }
@@ -552,7 +572,7 @@ int main(int argc, char* argv[]) {
         }
 
         for (int j = 0; j < num_frames; ++j) {
-            post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup], j, igroup);
+            post_recv(qps[igroup], header_mrs[igroup], mrs[igroup], cpu_buffers[igroup], gpu_buffers[igroup], j, igroup, save_gpu);
         }
     }
 
@@ -595,9 +615,9 @@ int main(int argc, char* argv[]) {
                 total_bytes += wc.byte_len;
                 total_packets += 1;
 
-                if (save_gpu) {
-                    GPUERRCHK(cudaMemcpy(cpu_buffers[igroup] + jframe * MTU, gpu_buffers[igroup] + jframe * MTU, size_to_copy, cudaMemcpyDeviceToHost));
-                }
+                // if (save_gpu) {
+                //     GPUERRCHK(cudaMemcpy(cpu_buffers[igroup] + jframe * MTU, gpu_buffers[igroup] + jframe * MTU, size_to_copy, cudaMemcpyDeviceToHost));
+                // }
 
                 char* packet = cpu_buffers[igroup] + jframe * MTU;
                 struct ether_header* eth;
@@ -670,7 +690,8 @@ int main(int argc, char* argv[]) {
                 }
 
                 // send the buffer back to the QP
-                post_recv(qps[igroup], mrs[igroup], gpu_buffers[igroup], jframe, igroup);  
+                post_recv(qps[igroup], header_mrs[igroup], mrs[igroup],
+                    cpu_buffers[igroup], gpu_buffers[igroup], jframe, igroup, save_gpu);
                 
                 // Increment count 
                 j += 1;
