@@ -104,7 +104,7 @@ struct ibv_flow* create_and_attach_default_flow(ibv_qp* qp) {
  * @param qp Pointer to the QP to attach the flow to.
  * @param udp_dport The destination port to match.
  */
-struct ibv_flow* create_udp_flow(ibv_qp* qp, uint16_t udp_dport) {
+struct ibv_flow* create_udp_flow(ibv_qp* qp, uint16_t udp_dport, uint32_t src_ip=0) {
     // Allocate memory for flow attributes and specs
     size_t flow_size = sizeof(struct ibv_flow_attr) +
                        sizeof(struct ibv_flow_spec_eth) +
@@ -136,6 +136,13 @@ struct ibv_flow* create_udp_flow(ibv_qp* qp, uint16_t udp_dport) {
     ipv4_spec->size = sizeof(struct ibv_flow_spec_ipv4);
     memset(&ipv4_spec->val, 0, sizeof(ipv4_spec->val));   // Match all
     memset(&ipv4_spec->mask, 0, sizeof(ipv4_spec->mask)); // No filtering
+    if (src_ip != 0) {
+        ipv4_spec->val.src_ip = htonl(src_ip); //match given source IP
+        ipv4_spec->mask.src_ip = 0xFFFFFFFF; // Filter on source IP
+        struct in_addr ip_addr;
+        ip_addr.s_addr = ntohl(src_ip);
+        std::cout << "IP Address: " << inet_ntoa(ip_addr) << std::endl;
+    }
 
     // Configure UDP spec (filter by destination port)
     udp_spec->type = IBV_FLOW_SPEC_UDP;
@@ -144,6 +151,7 @@ struct ibv_flow* create_udp_flow(ibv_qp* qp, uint16_t udp_dport) {
     udp_spec->mask.dst_port = 0xFFFF;          // Exact match on destination port
     udp_spec->val.src_port = 0;                // Match all source ports
     udp_spec->mask.src_port = 0;               // No filtering on source port
+
 
     // Attach the flow to the QP
     struct ibv_flow* flow = ibv_create_flow(qp, flow_attr);
@@ -310,9 +318,6 @@ void subscribe_to_multicast(const char* interface_name, ibv_qp* qp, const char* 
         return;
     }
 
-    // now attach to flow
-    create_udp_flow(qp, udp_port);
-
     std::cout << "Successfully subscribed " << interface_name << " to multicast group " 
               << multicast_ip << " on port " << udp_port << std::endl;
 
@@ -423,7 +428,9 @@ int main(int argc, char* argv[]) {
     int num_muliticast_groups = 1;
     int num_sge = 1; // Number of scatter gather entries per work request
     bool verbose = false;
+    int num_antennas = 1; // Default value for num_antennas
     Format format = Format::NONE; // Default: no format specified
+    std::string formatstr("none");
 
     // Define long options
     static struct option long_options[] = {
@@ -434,13 +441,14 @@ int main(int argc, char* argv[]) {
         {"num-blocks", required_argument, nullptr, 'b'},
         {"num-multicast-groups", required_argument, nullptr, 'm'},
         {"num-sge", required_argument, nullptr, 's'},
+        {"num-antennas", required_argument, nullptr, 'a'}, // New option for num_antennas
         {"verbose", no_argument, nullptr, 'v'},
         {"format", required_argument, nullptr, 'F'}, // New format option
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:vF:", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:a:vF:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'g':
                 save_gpu = true;
@@ -463,6 +471,13 @@ int main(int argc, char* argv[]) {
             case 's':
                 num_sge = std::atoi(optarg);
                 break;
+            case 'a': // Handle the num_antennas option
+                num_antennas = std::atoi(optarg);
+                if (num_antennas <= 0) {
+                    std::cerr << "Invalid number of antennas: " << num_antennas << ". Must be greater than 0." << std::endl;
+                    return 1;
+                }
+                break;
             case 'v':
                 verbose = true;
                 break;
@@ -475,11 +490,17 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Invalid format: " << optarg << ". Supported formats are 'raw' and 'codifhdr'." << std::endl;
                     return 1;
                 }
+                formatstr.assign(optarg);
                 break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>] [--format <raw|codifhdr>]" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>] [--num-antennas <count>] [--format <raw|codifhdr>]" << std::endl;
                 return 1;
         }
+    }
+
+    // Print the number of antennas for debugging
+    if (verbose) {
+        std::cout << "Number of antennas: " << num_antennas << std::endl;
     }
 
     if (save_gpu) {
@@ -505,17 +526,21 @@ int main(int argc, char* argv[]) {
 
     print_device_list();
     
+    int num_qps = num_muliticast_groups * num_antennas;
+    int num_threads = 2;
+    
     std::vector<ibv_context*> contexts(num_devices);
     std::vector<ibv_cq*> shared_cqs(num_devices);
 
-    std::vector<ibv_pd*> pds(num_muliticast_groups);
-    std::vector<ibv_qp*> qps(num_muliticast_groups);
-    std::vector<std::ofstream> files(num_muliticast_groups);
-    std::vector<char*> gpu_buffers(num_muliticast_groups);
-    std::vector<char*> cpu_buffers(num_muliticast_groups);
-    std::vector<ibv_mr*> header_mrs(num_muliticast_groups);
-    std::vector<ibv_mr*> mrs(num_muliticast_groups);
-    std::vector<uint64_t> frame_numbers(6*8);
+    std::vector<ibv_pd*> pds(num_qps);
+    std::vector<ibv_qp*> qps(num_qps);
+    std::vector<std::ofstream> files(num_qps);
+    std::vector<char*> gpu_buffers(num_qps);
+    std::vector<char*> cpu_buffers(num_qps);
+    std::vector<ibv_mr*> header_mrs(num_qps);
+    std::vector<ibv_mr*> mrs(num_qps);
+    std::vector<uint64_t> frame_numbers(num_threads*num_qps*20);
+    std::fill(frame_numbers.begin(), frame_numbers.end(), 0);
 
 
     for (int idevice = 0; idevice < num_devices; idevice++) {
@@ -534,47 +559,60 @@ int main(int argc, char* argv[]) {
     }
 
     for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
-        int idevice = igroup % num_devices;
+        for (int iant = 0; iant < num_antennas; iant++) {
+            int iqp = igroup * num_antennas + iant;
+            int idevice = igroup % num_devices; // Multicast group goes to the device
+            
+            std::string filename = std::string(multicast_groups[iqp].ip) 
+            + std::string("ant") 
+            + std::to_string(iant) 
+            + "." + formatstr;
+            if (format != Format::NONE) {
+                files[iqp].open(filename, std::ios::binary);
+            }
 
-        files[igroup].open(std::string(multicast_groups[igroup].ip) + ".raw", std::ios::binary);
+            pds[iqp] = ibv_alloc_pd(contexts[idevice]);
+            if (!pds[iqp]) {
+                std::cerr << "Failed to allocate PD: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+                exit(1);
+            }
 
-        pds[igroup] = ibv_alloc_pd(contexts[idevice]);
-        if (!pds[igroup]) {
-            std::cerr << "Failed to allocate PD: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
-            exit(1);
+            // Use the shared CQ for the corresponding device context
+            qps[iqp] = init_qp(contexts[idevice], pds[iqp], shared_cqs[idevice]);
+
+            // Allocate CPU memory
+            cpu_buffers[iqp] = (char*)malloc(num_frames * MTU);
+            memset(cpu_buffers[iqp], 0, num_frames * MTU);
+
+            if (save_gpu) {
+                GPUERRCHK(cudaMalloc(&gpu_buffers[iqp], num_frames * MTU));
+                GPUERRCHK(cudaDeviceSynchronize()); // Ensure memory is ready
+                GPUERRCHK(cudaMemset(gpu_buffers[iqp], 0, num_frames * MTU));
+                // Also make the CPU buffer a MR
+                header_mrs[iqp] = ibv_reg_mr(pds[iqp], cpu_buffers[iqp], num_frames * MTU,
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+
+            } else {
+                gpu_buffers[iqp] = cpu_buffers[iqp];
+            }
+
+            // Register memory region
+            mrs[iqp] = ibv_reg_mr(pds[iqp], gpu_buffers[iqp], num_frames * MTU,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+            if (!mrs[iqp]) {
+                std::cerr << "Failed to register memory region: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+                exit(1);
+            }
+
+            for (int jframe = 0; jframe < num_frames; ++jframe) {
+                post_recv(qps[iqp], header_mrs[iqp], mrs[iqp], cpu_buffers[iqp], gpu_buffers[iqp], jframe, iqp, save_gpu);
+            }
+            // now attach to flow
+            uint32_t antip = (130 << 24) | (155 << 16) | (178 << 8) | (211 + iant);
+            create_udp_flow(qps[iqp], multicast_groups[igroup].port, antip);
+
         }
-
-        // Use the shared CQ for the corresponding device context
-        qps[igroup] = init_qp(contexts[idevice], pds[igroup], shared_cqs[idevice]);
-
-        // Allocate CPU memory
-        cpu_buffers[igroup] = (char*)malloc(num_frames * MTU);
-        memset(cpu_buffers[igroup], 0, num_frames * MTU);
-
-        if (save_gpu) {
-            GPUERRCHK(cudaMalloc(&gpu_buffers[igroup], num_frames * MTU));
-            GPUERRCHK(cudaDeviceSynchronize()); // Ensure memory is ready
-            GPUERRCHK(cudaMemset(gpu_buffers[igroup], 0, num_frames * MTU));
-            // Also make the CPU buffer a MR
-            header_mrs[igroup] = ibv_reg_mr(pds[igroup], cpu_buffers[igroup], num_frames * MTU,
-                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-
-        } else {
-            gpu_buffers[igroup] = cpu_buffers[igroup];
-        }
-
-        // Register memory region
-        mrs[igroup] = ibv_reg_mr(pds[igroup], gpu_buffers[igroup], num_frames * MTU,
-                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        if (!mrs[igroup]) {
-            std::cerr << "Failed to register memory region: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
-            exit(1);
-        }
-
-        for (int j = 0; j < num_frames; ++j) {
-            post_recv(qps[igroup], header_mrs[igroup], mrs[igroup], cpu_buffers[igroup], gpu_buffers[igroup], j, igroup, save_gpu);
-        }
-    }
+}
 
     uint64_t busy_wait = 0;
     uint64_t total_bytes = 0;
@@ -607,19 +645,18 @@ int main(int argc, char* argv[]) {
 
                 auto size_to_copy = wc.byte_len;
                 uint64_t wrid = wc.wr_id; // ID - set to the frame number where the data was written
-                int igroup = static_cast<int>(wc.wr_id >> 32); // Extract the group ID from wr_id
+                int iqp = static_cast<int>(wc.wr_id >> 32); // Extract the qp number from wr_id
+                //int iqp = igroup * num_antennas + iant;
+                int iant = iqp % num_antennas; // Extract the antenna number from the QP ID
+                int igroup = iqp / num_antennas; // Extract the group number from the QP ID
+
                 int jframe = static_cast<int>(wc.wr_id & 0xFFFFFFFF); // Extract the frame number from wr_id
-                //int igroup = wc.qp_num; // Use QP number to identify the group
                 assert(igroup >= 0 && igroup < num_muliticast_groups);
                 
                 total_bytes += wc.byte_len;
                 total_packets += 1;
 
-                // if (save_gpu) {
-                //     GPUERRCHK(cudaMemcpy(cpu_buffers[igroup] + jframe * MTU, gpu_buffers[igroup] + jframe * MTU, size_to_copy, cudaMemcpyDeviceToHost));
-                // }
-
-                char* packet = cpu_buffers[igroup] + jframe * MTU;
+                char* packet = cpu_buffers[iqp] + jframe * MTU;
                 struct ether_header* eth;
                 struct ip* ip_hdr;
                 struct udphdr* uudp_hdr;
@@ -639,38 +676,39 @@ int main(int argc, char* argv[]) {
                 int antid = codif_hdr->groupid - 257;
                 assert(antid >= 0 && antid < 6);
 
-                int totalid = antid + 6*codif_hdr->threadid;
+                int totalid = codif_hdr->threadid  + num_threads*iqp;
                 // Only track for device = i
 
                 if (verbose) {
-                    printf("blk =%d dev=%d igroup=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d\n",
-                         blk, idevice, igroup, j, jframe, wc.byte_len, is_codif,
+                    printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d\n",
+                         blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
                         codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
                         codif_hdr->threadid, antid, totalid, codif_hdr->frame);
                 }
 
-                if (igroup == 0) { // only care about first multicast group for now. Too hard otherwise.
-                    if (frame_numbers[totalid] == 0) {
-                        frame_numbers[totalid] = codif_hdr->frame;
-                    }
-                    if (frame_numbers[totalid] != codif_hdr->frame) {
-                        if (!verbose) {
-                            printf("blk =%d dev=%d igroup=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d",
-                                blk, idevice, igroup, j, jframe, wc.byte_len, is_codif,
-                            codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
-                            codif_hdr->threadid, antid, totalid, codif_hdr->frame);
-                        }
-                        std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
-                        num_mismatches += 1;
-                    }
-                    frame_numbers[totalid] = codif_hdr->frame + 1;
+                assert(totalid >= 0 && totalid < frame_numbers.size());
+
+                if (frame_numbers[totalid] == 0) {
+                    frame_numbers[totalid] = codif_hdr->frame;
                 }
+                if (frame_numbers[totalid] != codif_hdr->frame) {
+                    if (!verbose) {
+                        printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d",
+                            blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
+                        codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
+                        codif_hdr->threadid, antid, totalid, codif_hdr->frame);
+                    }
+                    std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
+                    num_mismatches += 1;
+                }
+                frame_numbers[totalid] = (codif_hdr->frame + 1) % 1000000;
+                
 
                 // Write based on the specified format
                 if (format == Format::RAW) {
-                    files[igroup].write(packet, size_to_copy);
+                    files[iqp].write(packet, size_to_copy);
                 } else if (format == Format::CODIFHDR && is_codif) {
-                    files[igroup].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                    files[iqp].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
                 }
 
                 // Write to PCAP only if format is specified
@@ -690,8 +728,9 @@ int main(int argc, char* argv[]) {
                 }
 
                 // send the buffer back to the QP
-                post_recv(qps[igroup], header_mrs[igroup], mrs[igroup],
-                    cpu_buffers[igroup], gpu_buffers[igroup], jframe, igroup, save_gpu);
+                post_recv(qps[iqp], header_mrs[iqp], mrs[iqp], 
+                    cpu_buffers[iqp], gpu_buffers[iqp], jframe, iqp, save_gpu);
+
                 
                 // Increment count 
                 j += 1;
