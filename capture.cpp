@@ -34,6 +34,8 @@ const char* interfaces[] = {"ens3f0np0", "ens3f1np1", "ens6f0np0", "ens6f1np1"};
 const int MTU = (9000/64 + 1) * 64; // 9000 bytes, aligned to 64 bytes
 const int num_frames = 100;
 
+const int MAX_POLL_BLOCKS = num_frames; // Maximum number of poll blocks
+
 const int ETH_HDR_SIZE = 14; // Ethernet header size
 const int IP_HDR_SIZE = 20; // IP header size
 const int UDP_HDR_SIZE = 8; // UDP header size
@@ -419,6 +421,19 @@ enum class Format {
     CODIFHDR   // Write only CODIF headers
 };
 
+int set_priority() {
+    struct sched_param param;
+    int priority = 99; // Highest real-time priority
+
+    param.sched_priority = priority;
+
+    // Set the scheduling policy to SCHED_FIFO
+    if (sched_setscheduler(0, SCHED_RR, &param) == -1) {
+        std::cerr << "Failed to set SCHED_FIFO: " << strerror(errno) << std::endl;
+        return 1;
+    }
+}
+
 int main(int argc, char* argv[]) {
     bool save_gpu = false;
     int cuda_dev = 0;
@@ -431,6 +446,7 @@ int main(int argc, char* argv[]) {
     int num_antennas = 1; // Default value for num_antennas
     Format format = Format::NONE; // Default: no format specified
     std::string formatstr("none");
+    int poll_block_size = 1; // Default block size is 1
 
     // Define long options
     static struct option long_options[] = {
@@ -444,11 +460,12 @@ int main(int argc, char* argv[]) {
         {"num-antennas", required_argument, nullptr, 'a'}, // New option for num_antennas
         {"verbose", no_argument, nullptr, 'v'},
         {"format", required_argument, nullptr, 'F'}, // New format option
+        {"poll-block-size", required_argument, nullptr, 'p'}, // New option for poll block size
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:a:vF:", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "gd:n:f:b:m:s:a:vF:p:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'g':
                 save_gpu = true;
@@ -492,8 +509,15 @@ int main(int argc, char* argv[]) {
                 }
                 formatstr.assign(optarg);
                 break;
+            case 'p': // Handle the poll block size option
+                poll_block_size = std::atoi(optarg);
+                if (poll_block_size <= 0 || poll_block_size > MAX_POLL_BLOCKS) {
+                    std::cerr << "Invalid poll block size: " << poll_block_size << ". Must be between 1 and 32" << std::endl;
+                    return 1;
+                }
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>] [--num-antennas <count>] [--format <raw|codifhdr>]" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " [--save-gpu] [--cuda-dev <device>] [--num-devices <count>] [--num-frames <count>] [--num-blocks <count>] [--num-multicast-groups <count>] [--num-antennas <count>] [--format <raw|codifhdr>] [--poll-block-size <1-32>]" << std::endl;
                 return 1;
         }
     }
@@ -510,6 +534,10 @@ int main(int argc, char* argv[]) {
         std::cout << "Using GPU device: " << cuda_dev << " " << prop.name <<
             " Supports GPUDirect? " << (prop.tccDriver ? "Yes (TCC mode)" : "No (likely WDDM or not supported)") << std::endl;
     }
+
+    // Use chrt instead
+    // but as it happens, using SCHED_FIFO and SCHED_RR makes thigns worse! 
+    //set_priority();
 
     pcap_t* pcap = pcap_open_dead(DLT_EN10MB, MTU); // Ethernet link-layer, max packet size
     if (!pcap) {
@@ -618,6 +646,8 @@ int main(int argc, char* argv[]) {
     uint64_t total_bytes = 0;
     uint64_t total_packets = 0;
     uint64_t num_mismatches = 0;
+    uint64_t num_polls = 0;
+    uint64_t max_num_polled = 0;
 
     // We'll all ready - now subscribe
     for (int igroup = 0; igroup < num_muliticast_groups; ++igroup) {
@@ -631,109 +661,120 @@ int main(int argc, char* argv[]) {
         int j = 0;
         while (j < num_frames) {
             for (int idevice = 0; idevice < num_devices; ++idevice) {
-                ibv_wc wc;
-                // Poll the shared CQ for the current device
-                if (ibv_poll_cq(shared_cqs[idevice], 1, &wc) < 1) { // Busy wait
-                    busy_wait += 1;
-                    continue;
-                }
-
-                if (wc.status != IBV_WC_SUCCESS) {
-                    std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
+                ibv_wc wc_array[MAX_POLL_BLOCKS]; // Array to hold up to MAX_POLL_BLOCKS WCs
+                int num_polled = ibv_poll_cq(shared_cqs[idevice], poll_block_size, wc_array);
+                
+                if (num_polled < 0) {
+                    std::cerr << "Failed to poll CQ: " << strerror(errno) << std::endl;
                     exit(1);
                 }
 
-                auto size_to_copy = wc.byte_len;
-                uint64_t wrid = wc.wr_id; // ID - set to the frame number where the data was written
-                int iqp = static_cast<int>(wc.wr_id >> 32); // Extract the qp number from wr_id
-                //int iqp = igroup * num_antennas + iant;
-                int iant = iqp % num_antennas; // Extract the antenna number from the QP ID
-                int igroup = iqp / num_antennas; // Extract the group number from the QP ID
+                max_num_polled = std::max(max_num_polled, static_cast<uint64_t>(num_polled));
 
-                int jframe = static_cast<int>(wc.wr_id & 0xFFFFFFFF); // Extract the frame number from wr_id
-                assert(igroup >= 0 && igroup < num_muliticast_groups);
-                
-                total_bytes += wc.byte_len;
-                total_packets += 1;
-
-                char* packet = cpu_buffers[iqp] + jframe * MTU;
-                struct ether_header* eth;
-                struct ip* ip_hdr;
-                struct udphdr* uudp_hdr;
-                struct codif_header* codif_hdr;
-                parse_packet(packet, &eth, &ip_hdr, &uudp_hdr, &codif_hdr);
-                bool is_codif;
-                                
-                if (uudp_hdr != nullptr) {
-                    auto dport = (uudp_hdr->uh_dport);
-                    is_codif = wc.byte_len == 8298; // My dport parsing is no good. && dport > 36000; // There are more rigorous checks, but this is easy.
-                } else {
-                    //std::cout << "Not an IP packet" << std::endl;
-                    is_codif = false;
+                if (num_polled == 0) {
+                    busy_wait += 1;
+                    continue;
                 }
+                num_polls += 1;
 
-                //
-                int antid = codif_hdr->groupid - 257;
-                assert(antid >= 0 && antid < 6);
+                for (int i = 0; i < num_polled; ++i) {
+                    ibv_wc& wc = wc_array[i];
 
-                int totalid = codif_hdr->threadid  + num_threads*iqp;
-                // Only track for device = i
-
-                if (verbose) {
-                    printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d\n",
-                         blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
-                        codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
-                        codif_hdr->threadid, antid, totalid, codif_hdr->frame);
-                }
-
-                assert(totalid >= 0 && totalid < frame_numbers.size());
-
-                if (frame_numbers[totalid] == 0) {
-                    frame_numbers[totalid] = codif_hdr->frame;
-                }
-                if (frame_numbers[totalid] != codif_hdr->frame) {
-                    if (!verbose) {
-                        printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d",
-                            blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
-                        codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
-                        codif_hdr->threadid, antid, totalid, codif_hdr->frame);
+                    if (wc.status != IBV_WC_SUCCESS) {
+                        std::cerr << "Failed to poll CQ: " << ibv_wc_status_str(wc.status) << " (status: " << wc.status << ")" << std::endl;
+                        exit(1);
                     }
-                    std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
-                    num_mismatches += 1;
+
+                    auto size_to_copy = wc.byte_len;
+                    uint64_t wrid = wc.wr_id; // ID - set to the frame number where the data was written
+                    int iqp = static_cast<int>(wc.wr_id >> 32); // Extract the qp number from wr_id
+                    int iant = iqp % num_antennas; // Extract the antenna number from the QP ID
+                    int igroup = iqp / num_antennas; // Extract the group number from the QP ID
+
+                    int jframe = static_cast<int>(wc.wr_id & 0xFFFFFFFF); // Extract the frame number from wr_id
+                    assert(igroup >= 0 && igroup < num_muliticast_groups);
+                    
+                    total_bytes += wc.byte_len;
+                    total_packets += 1;
+
+                    char* packet = cpu_buffers[iqp] + jframe * MTU;
+                    struct ether_header* eth;
+                    struct ip* ip_hdr;
+                    struct udphdr* uudp_hdr;
+                    struct codif_header* codif_hdr;
+                    parse_packet(packet, &eth, &ip_hdr, &uudp_hdr, &codif_hdr);
+                    bool is_codif;
+                                    
+                    if (uudp_hdr != nullptr) {
+                        auto dport = (uudp_hdr->uh_dport);
+                        is_codif = wc.byte_len == 8298; // My dport parsing is no good. && dport > 36000; // There are more rigorous checks, but this is easy.
+                    } else {
+                        is_codif = false;
+                    }
+
+                    //
+                    int antid = codif_hdr->groupid - 257;
+                    assert(antid >= 0 && antid < 6);
+
+                    int totalid = codif_hdr->threadid  + num_threads*iqp;
+                    // Only track for device = i
+
+                    if (verbose) {
+                        printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d\n",
+                            blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
+                            codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
+                            codif_hdr->threadid, antid, totalid, codif_hdr->frame);
+                    }
+
+                    assert(totalid >= 0 && totalid < frame_numbers.size());
+
+                    if (frame_numbers[totalid] == 0) {
+                        frame_numbers[totalid] = codif_hdr->frame;
+                    }
+                    if (frame_numbers[totalid] != codif_hdr->frame) {
+                        if (!verbose) {
+                            printf("blk =%d dev=%d igroup=%d iant=%d iqp=%d j=%d jframe=%d byte_len=%d codif?=%d sync=%x %d-%d-%d antid=%d totalid=%d %d",
+                                blk, idevice, igroup, iant, iqp, j, jframe, wc.byte_len, is_codif,
+                            codif_hdr->sync, codif_hdr->secondaryid,  codif_hdr->groupid,
+                            codif_hdr->threadid, antid, totalid, codif_hdr->frame);
+                        }
+                        std::cout << "Frame number mismatch: " << frame_numbers[totalid] << " != " << codif_hdr->frame << std::endl;
+                        num_mismatches += 1;
+                    }
+                    frame_numbers[totalid] = (codif_hdr->frame + 1) % 1000000;
+                    
+
+                    // Write based on the specified format
+                    if (format == Format::RAW) {
+                        files[iqp].write(packet, size_to_copy);
+                    } else if (format == Format::CODIFHDR && is_codif) {
+                        files[iqp].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
+                    }
+
+                    // Write to PCAP only if format is specified
+                    if (format != Format::NONE) {
+                        // Create a PCAP packet header
+                        struct timeval tv;
+                        gettimeofday(&tv, nullptr);
+                        struct pcap_pkthdr header;
+                        memset(&header, 0, sizeof(header));
+                        header.ts.tv_sec = tv.tv_sec; // Current timestamp (seconds)
+                        header.ts.tv_usec = tv.tv_usec; // Microseconds
+                        header.caplen = size_to_copy; // Captured length
+                        header.len = wc.byte_len; // Original packet length
+
+                        // Write the packet to the PCAP file
+                        pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
+                    }
+
+                    // send the buffer back to the QP
+                    post_recv(qps[iqp], header_mrs[iqp], mrs[iqp], 
+                        cpu_buffers[iqp], gpu_buffers[iqp], jframe, iqp, save_gpu);
+
+                    
+                    // Increment count 
+                    j += 1;
                 }
-                frame_numbers[totalid] = (codif_hdr->frame + 1) % 1000000;
-                
-
-                // Write based on the specified format
-                if (format == Format::RAW) {
-                    files[iqp].write(packet, size_to_copy);
-                } else if (format == Format::CODIFHDR && is_codif) {
-                    files[iqp].write(packet + ETH_HDR_SIZE + IP_HDR_SIZE + UDP_HDR_SIZE, CODIF_HDR_SIZE);
-                }
-
-                // Write to PCAP only if format is specified
-                if (format != Format::NONE) {
-                    // Create a PCAP packet header
-                    struct timeval tv;
-                    gettimeofday(&tv, nullptr);
-                    struct pcap_pkthdr header;
-                    memset(&header, 0, sizeof(header));
-                    header.ts.tv_sec = tv.tv_sec; // Current timestamp (seconds)
-                    header.ts.tv_usec = tv.tv_usec; // Microseconds
-                    header.caplen = size_to_copy; // Captured length
-                    header.len = wc.byte_len; // Original packet length
-
-                    // Write the packet to the PCAP file
-                    pcap_dump(reinterpret_cast<u_char*>(dumper), &header, reinterpret_cast<const u_char*>(packet));
-                }
-
-                // send the buffer back to the QP
-                post_recv(qps[iqp], header_mrs[iqp], mrs[iqp], 
-                    cpu_buffers[iqp], gpu_buffers[iqp], jframe, iqp, save_gpu);
-
-                
-                // Increment count 
-                j += 1;
             }
         }
     }
@@ -743,6 +784,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Busy wait: " << busy_wait << std::endl;
     std::cout << "Average bytes per packet: " << (total_bytes / total_packets) << std::endl;
     std::cout << "Busy wait / packet " << (busy_wait / total_packets) << std::endl;
+    std::cout << "Busy wait / polls " << (busy_wait / num_polls) << std::endl;
+    std::cout << "Max packets polled " << max_num_polled << std::endl;
+    std::cout << "Average packets / poll " <<  float(total_packets) / float(num_polls) << std::endl;
     std::cout << "Num mismatches " << num_mismatches << std::endl;
 
 
