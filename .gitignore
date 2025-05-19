@@ -15,6 +15,9 @@ core*
 
 # captured files
 *.raw
+*.none
+*.codifhdr
+
 # binary
 capture
 
